@@ -32,6 +32,17 @@ try {
     viewport: { width: 1280, height: 800 },
     reducedMotion: 'reduce',
   })
+  await page.addInitScript(() => {
+    window.__clashforkQaVisibility = 'visible'
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => window.__clashforkQaVisibility,
+    })
+    Object.defineProperty(document, 'hidden', {
+      configurable: true,
+      get: () => window.__clashforkQaVisibility === 'hidden',
+    })
+  })
   page.setDefaultTimeout(25000)
   const errors = []
   const consoleIssues = []
@@ -43,6 +54,16 @@ try {
   })
 
   const heading = (name) => page.getByRole('heading', { name, exact: true }).first()
+  const mockCalls = (command) => page.evaluate((name) => window.__clashforkMockCalls?.[name] ?? 0, command)
+  const mockPendingCalls = (command) => page.evaluate((name) => window.__clashforkMockPendingCalls?.[name] ?? 0, command)
+  const setPageVisibility = (state) => page.evaluate((next) => {
+    window.__clashforkQaVisibility = next
+    document.dispatchEvent(new Event('visibilitychange'))
+  }, state)
+  const waitForMockCalls = (command, count) => page.waitForFunction(
+    ({ name, expected }) => (window.__clashforkMockCalls?.[name] ?? 0) >= expected,
+    { name: command, expected: count },
+  )
   const open = async (name) => {
     await page.getByRole('navigation').getByRole('button', { name, exact: true }).click()
     await heading(name).waitFor()
@@ -57,6 +78,15 @@ try {
 
   await page.goto(url.href, { waitUntil: 'domcontentloaded' })
   await heading('Dashboard').waitFor()
+  await waitForMockCalls('get_live_rates', 1)
+  await page.waitForFunction(() => (window.__clashforkMockPendingCalls?.get_live_rates ?? 0) > 0)
+  const initialRateCalls = await mockCalls('get_live_rates')
+  await setPageVisibility('hidden')
+  await page.waitForTimeout(1200)
+  assert.equal(await mockCalls('get_live_rates'), initialRateCalls, 'hidden Dashboard must cancel in-flight rates polling and its next timer')
+  assert.equal(await mockPendingCalls('get_live_rates'), 0, 'hidden Dashboard must ignore the in-flight rates result')
+  await setPageVisibility('visible')
+  await waitForMockCalls('get_live_rates', initialRateCalls + 1)
   assert.match(await page.title(), /Clashfork/)
   assert.match(await page.locator('#root').innerText(), /Dashboard/)
   assert.equal(await page.getByText(/Vite|Webpack|Next\.js.*error/i).count(), 0)
@@ -89,6 +119,7 @@ try {
   await page.getByText('Rule · AI', { exact: true }).first().waitFor()
   await page.locator('.chart-download[d*="L"]').waitFor()
   await page.waitForTimeout(3200)
+  assert.equal(await mockCalls('get_live'), 0, 'Dashboard must poll only the lightweight rates endpoint')
   await capture('dashboard')
 
   await open('Nodes')
@@ -106,11 +137,31 @@ try {
   await page.getByText('Miscellaneous', { exact: true }).first().waitFor()
   await capture('rulesets')
   await open('Live Connections')
+  await waitForMockCalls('get_live', 1)
+  const connectionCalls = await mockCalls('get_live')
+  const rateCallsBeforeConnections = await mockCalls('get_live_rates')
+  await page.waitForFunction(() => (window.__clashforkMockPendingCalls?.get_live ?? 0) > 0)
+  assert.equal(await mockCalls('get_live_rates'), rateCallsBeforeConnections, 'Connections must not poll the Dashboard rates endpoint')
+  await setPageVisibility('hidden')
+  await page.waitForTimeout(1200)
+  assert.equal(await mockCalls('get_live'), connectionCalls, 'hidden Connections must stop full snapshot polling')
+  assert.equal(await mockPendingCalls('get_live'), 0, 'hidden Connections must ignore the in-flight full snapshot')
+  await setPageVisibility('visible')
+  await waitForMockCalls('get_live', connectionCalls + 1)
   await page.getByRole('table').waitFor()
   await page.getByRole('cell', { name: 'ChatGPT.exe', exact: true }).first().waitFor()
   await capture('live')
   await open('Logs')
   await page.getByRole('tab', { name: 'Traffic History', exact: true }).waitFor()
+  await waitForMockCalls('get_history', 1)
+  const historyCalls = await mockCalls('get_history')
+  await page.waitForFunction(() => (window.__clashforkMockPendingCalls?.get_history ?? 0) > 0)
+  await setPageVisibility('hidden')
+  await page.waitForTimeout(250)
+  assert.equal(await mockCalls('get_history'), historyCalls, 'hidden History must not restart a report request')
+  assert.equal(await mockPendingCalls('get_history'), 0, 'hidden History must ignore its in-flight report result')
+  await setPageVisibility('visible')
+  await waitForMockCalls('get_history', historyCalls + 1)
   await page.getByRole('button', { name: '7 days', exact: true }).click()
   await page.getByRole('table').waitFor()
   const historyTable = page.locator('.history-table')
@@ -243,9 +294,15 @@ try {
   assert.ok(initialDiagnostics[0].id > initialDiagnostics[1].id, 'equal seconds break by newest ID')
   assert.match(await page.locator('.diagnostic-line').first().innerText(), /Northwind refresh failed/)
   await page.getByRole('button', { name: 'Refresh', exact: true }).click()
-  await page.waitForTimeout(250)
+  await waitForMockCalls('get_diagnostics', 2)
+  await page.waitForFunction(() => (window.__clashforkMockPendingCalls?.get_diagnostics ?? 0) > 0)
   assertNewestFirst(await diagnosticOrder())
+  const diagnosticCalls = await mockCalls('get_diagnostics')
+  await setPageVisibility('hidden')
   await page.waitForTimeout(2300)
+  assert.equal(await mockCalls('get_diagnostics'), diagnosticCalls, 'hidden Diagnostics must stop polling')
+  await setPageVisibility('visible')
+  await waitForMockCalls('get_diagnostics', diagnosticCalls + 1)
   assertNewestFirst(await diagnosticOrder())
   await capture('diagnostics')
 
@@ -276,6 +333,9 @@ try {
       }
 
       if (screen === 'Dashboard') {
+        await page.waitForFunction(() =>
+          document.querySelectorAll('.chart-point').length === 2 || document.querySelector('.chart-area') !== null,
+        )
         const cards = await page.evaluate(() => {
           const vpn = document.querySelector('.vpn-panel').getBoundingClientRect()
           const vpnHeading = document.querySelector('.vpn-heading').getBoundingClientRect()

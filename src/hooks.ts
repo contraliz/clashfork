@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import { api, isTauri } from './api'
-import type { LiveSnapshot } from './types'
+import type { LiveRates, LiveSnapshot } from './types'
 
 const emptyLive: LiveSnapshot = {
   active: false,
@@ -12,31 +12,70 @@ const emptyLive: LiveSnapshot = {
   sampledAt: 0,
 }
 
-export function useLive(enabled = true): LiveSnapshot {
-  const [live, setLive] = useState<LiveSnapshot>(emptyLive)
+const emptyRates: LiveRates = {
+  active: false,
+  downloadRate: 0,
+  uploadRate: 0,
+  downloadTotal: 0,
+  uploadTotal: 0,
+  sampledAt: 0,
+}
+
+function subscribeDocumentVisibility(onChange: () => void) {
+  if (typeof document === 'undefined') return () => {}
+  document.addEventListener('visibilitychange', onChange)
+  return () => document.removeEventListener('visibilitychange', onChange)
+}
+
+export function isDocumentVisible() {
+  return typeof document === 'undefined' || document.visibilityState !== 'hidden'
+}
+
+export function useDocumentVisible(): boolean {
+  return useSyncExternalStore(subscribeDocumentVisibility, isDocumentVisible, () => true)
+}
+
+function useVisiblePoll<T extends { active: boolean }>(
+  enabled: boolean,
+  load: () => Promise<T>,
+  initial: T,
+): T {
+  const [value, setValue] = useState<T>(initial)
+  const visible = useDocumentVisible()
   useEffect(() => {
-    if (!enabled) return
+    if (!enabled || !visible || !isDocumentVisible()) return
     let cancelled = false
     let timer: number | undefined
     const poll = async () => {
       try {
-        const next = await api.getLive()
-        if (!cancelled) setLive(next)
+        const next = await load()
+        if (!cancelled && isDocumentVisible()) setValue(next)
       } catch {
-        if (!cancelled) setLive((current) => ({ ...current, active: false }))
+        if (!cancelled && isDocumentVisible()) setValue((current) => ({ ...current, active: false }))
       }
-      if (!cancelled) timer = window.setTimeout(poll, 1000)
+      if (!cancelled && isDocumentVisible()) timer = window.setTimeout(poll, 1000)
     }
     void poll()
     return () => {
       cancelled = true
       if (timer) window.clearTimeout(timer)
     }
-  }, [enabled])
-  return live
+  }, [enabled, load, visible])
+  return value
 }
 
-export function useRatePoints(live: LiveSnapshot, limit = 60): Array<{ at: number; download: number; upload: number }> {
+export function useLive(enabled = true): LiveSnapshot {
+  return useVisiblePoll(enabled, api.getLive, emptyLive)
+}
+
+export function useLiveRates(enabled = true): LiveRates {
+  return useVisiblePoll(enabled, api.getLiveRates, emptyRates)
+}
+
+export function useRatePoints(
+  live: Pick<LiveSnapshot, 'active' | 'downloadRate' | 'uploadRate' | 'sampledAt'>,
+  limit = 60,
+): Array<{ at: number; download: number; upload: number }> {
   const [points, setPoints] = useState<Array<{ at: number; download: number; upload: number }>>([])
   useEffect(() => {
     if (!live.active) {

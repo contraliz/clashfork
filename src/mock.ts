@@ -5,6 +5,7 @@ import type {
   HistoryInput,
   HistoryReport,
   ImportPreview,
+  LiveRates,
   LiveSnapshot,
   NodeView,
   ServiceView,
@@ -14,6 +15,20 @@ import type {
 const now = () => Math.floor(Date.now() / 1000)
 const useEmptyRulesetFixture =
   typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('fixture') === 'empty-rulesets'
+
+function trackMockPending<T>(command: string, promise: Promise<T>): Promise<T> {
+  const qaWindow = typeof window === 'undefined'
+    ? null
+    : window as Window & { __clashforkMockPendingCalls?: Record<string, number> }
+  if (qaWindow) {
+    qaWindow.__clashforkMockPendingCalls ??= {}
+    qaWindow.__clashforkMockPendingCalls[command] = (qaWindow.__clashforkMockPendingCalls[command] ?? 0) + 1
+  }
+  return promise.finally(() => {
+    if (!qaWindow?.__clashforkMockPendingCalls) return
+    qaWindow.__clashforkMockPendingCalls[command] = Math.max(0, (qaWindow.__clashforkMockPendingCalls[command] ?? 1) - 1)
+  })
+}
 
 const services: ServiceView[] = [
   {
@@ -190,6 +205,11 @@ const pendingPreview = (id: string, nodes: ImportPreview['nodes'], sourceType: I
 })
 
 export async function invoke(command: string, args?: Record<string, unknown>): Promise<unknown> {
+  if (typeof window !== 'undefined') {
+    const qaWindow = window as Window & { __clashforkMockCalls?: Record<string, number> }
+    qaWindow.__clashforkMockCalls ??= {}
+    qaWindow.__clashforkMockCalls[command] = (qaWindow.__clashforkMockCalls[command] ?? 0) + 1
+  }
   switch (command) {
     case 'get_snapshot':
       return delay(snapshot())
@@ -418,11 +438,16 @@ export async function invoke(command: string, args?: Record<string, unknown>): P
       if (!args?.confirm) throw new Error('Confirmation is required to clear traffic history.')
       return delay(snapshot())
     case 'get_history':
-      return delay(history(args?.input as HistoryInput, state.customAppGroups))
+      return trackMockPending('get_history', delay(history(args?.input as HistoryInput, state.customAppGroups)))
     case 'get_live':
-      return live()
+      return trackMockPending('get_live', delay(live()))
+    case 'get_live_rates': {
+      const { active, downloadRate, uploadRate, downloadTotal, uploadTotal, sampledAt } = live()
+      const rates: LiveRates = { active, downloadRate, uploadRate, downloadTotal, uploadTotal, sampledAt }
+      return trackMockPending('get_live_rates', delay(rates))
+    }
     case 'get_diagnostics':
-      return delay(diagnostics())
+      return trackMockPending('get_diagnostics', delay(diagnostics()))
     case 'save_custom_group': {
       const input = args?.group as CustomAppGroup
       const clean = {

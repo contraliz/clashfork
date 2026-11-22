@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { api } from '../api'
-import { useLive, useRatePoints } from '../hooks'
+import { useLiveRates, useRatePoints } from '../hooks'
 import { formatBytes, formatRate } from '../lib/format'
 import type { Mode, Snapshot } from '../types'
 import {
@@ -24,7 +24,7 @@ interface Props {
 
 export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
   const { state, runtime } = snapshot
-  const live = useLive(true)
+  const live = useLiveRates(true)
   const points = useRatePoints(live)
   const [busy, setBusy] = useState<string | null>(null)
   const [presetOpen, setPresetOpen] = useState(false)

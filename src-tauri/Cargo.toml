@@ -1,6 +1,6 @@
 [package]
 name = "clashfork"
-version = "1.0.3"
+version = "1.0.4"
 description = "Clashfork desktop client"
 authors = ["Clashfork contributors"]
 license = "GPL-3.0-only"

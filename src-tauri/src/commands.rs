@@ -1,7 +1,8 @@
 use crate::{
     models::{
         AddNodesInput, AppState, CustomAppGroup, DiagnosticEntry, HistoryInput, HistoryReport,
-        ImportPreview, LiveSnapshot, SaveMatchGroupInput, SaveRulesetInput, Selection, Snapshot,
+        ImportPreview, LiveRates, LiveSnapshot, SaveMatchGroupInput, SaveRulesetInput, Selection,
+        Snapshot,
     },
     runtime::AppRuntime,
 };
@@ -155,6 +156,11 @@ pub fn get_history(runtime: Runtime<'_>, input: HistoryInput) -> Result<HistoryR
 #[tauri::command]
 pub fn get_live(runtime: Runtime<'_>) -> LiveSnapshot {
     runtime.live_snapshot()
+}
+
+#[tauri::command]
+pub fn get_live_rates(runtime: Runtime<'_>) -> LiveRates {
+    runtime.live_rates()
 }
 
 #[tauri::command]

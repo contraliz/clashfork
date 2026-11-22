@@ -6,6 +6,7 @@ import type {
   HistoryInput,
   HistoryReport,
   ImportPreview,
+  LiveRates,
   LiveSnapshot,
   SaveMatchGroupInput,
   SaveRulesetInput,
@@ -92,6 +93,7 @@ export const api = {
     call<Snapshot>('clear_history', { confirm }),
   getHistory: (input: HistoryInput) => call<HistoryReport>('get_history', { input }),
   getLive: () => call<LiveSnapshot>('get_live'),
+  getLiveRates: () => call<LiveRates>('get_live_rates'),
   getDiagnostics: () => call<import('./types').DiagnosticEntry[]>('get_diagnostics'),
   saveCustomGroup: (group: CustomAppGroup) =>
     call<Snapshot>('save_custom_group', { group }),

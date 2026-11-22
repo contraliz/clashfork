@@ -162,6 +162,15 @@ export interface LiveSnapshot {
   sampledAt: number
 }
 
+export interface LiveRates {
+  active: boolean
+  downloadRate: number
+  uploadRate: number
+  downloadTotal: number
+  uploadTotal: number
+  sampledAt: number
+}
+
 export interface HistoryBar {
   start: number
   label: string

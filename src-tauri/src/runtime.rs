@@ -4,7 +4,7 @@ use crate::{
     history::HistoryStore,
     models::{
         AppState, CoreStatus, CustomAppGroup, HistoryInput, HistoryReport, ImportPreview,
-        LiveRoute, LiveSnapshot, Mode, NodeView, PendingImport, RouteClass, RuntimeView,
+        LiveRates, LiveRoute, LiveSnapshot, Mode, NodeView, PendingImport, RouteClass, RuntimeView,
         SecretStore, ServiceView, Snapshot, SourceType,
     },
     paths::AppPaths,
@@ -1251,6 +1251,18 @@ impl AppRuntime {
             download_total: live.download_total,
             upload_total: live.upload_total,
             connections: live.connections.clone(),
+            sampled_at: live.sampled_at,
+        }
+    }
+
+    pub fn live_rates(&self) -> LiveRates {
+        let live = self.live.lock();
+        LiveRates {
+            active: live.active,
+            download_rate: live.download_rate,
+            upload_rate: live.upload_rate,
+            download_total: live.download_total,
+            upload_total: live.upload_total,
             sampled_at: live.sampled_at,
         }
     }

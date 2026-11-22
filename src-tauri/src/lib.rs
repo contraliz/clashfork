@@ -51,6 +51,7 @@ pub fn run() {
             commands::clear_history,
             commands::get_history,
             commands::get_live,
+            commands::get_live_rates,
             commands::get_diagnostics,
             commands::save_custom_group,
             commands::delete_custom_group,

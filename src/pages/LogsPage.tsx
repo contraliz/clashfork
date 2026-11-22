@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import { formatBytes, formatTime, prettyDateRange } from '../lib/format'
 import { sortDiagnosticsNewestFirst } from '../lib/diagnostics'
+import { isDocumentVisible, useDocumentVisible } from '../hooks'
 import type {
   CustomAppGroup,
   DiagnosticEntry,
@@ -64,6 +65,7 @@ function historyPeriodLabel(bar: HistoryBar, range: Range): string {
 }
 
 export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
+  const visible = useDocumentVisible()
   const [tab, setTab] = useState<'history' | 'diagnostics'>('history')
   const [range, setRange] = useState<Range>('7d')
   const [breakdown, setBreakdown] = useState<Breakdown>('app')
@@ -79,6 +81,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
   const [diagnostics, setDiagnostics] = useState<DiagnosticEntry[]>([])
 
   useEffect(() => {
+    if (!visible || !isDocumentVisible()) return
     let cancelled = false
     setReport(null)
     setInspectedPeriod(null)
@@ -89,7 +92,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
       routeFilter: routeFilter === 'all' ? null : routeFilter,
       subjectFilter,
     }).then((nextReport) => {
-      if (cancelled) return
+      if (cancelled || !isDocumentVisible()) return
       setReport(nextReport)
       setAvailableApps(nextReport.availableApps)
       if (
@@ -105,9 +108,9 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
         setSubjectFilter(null)
       }
     }).catch((error: unknown) => {
-      if (!cancelled) onError(error)
+      if (!cancelled && isDocumentVisible()) onError(error)
     }).finally(() => {
-      if (!cancelled) setBusy((current) => current === 'history' ? null : current)
+      if (!cancelled && isDocumentVisible()) setBusy((current) => current === 'history' ? null : current)
     })
     return () => {
       cancelled = true
@@ -116,6 +119,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
     breakdown,
     onError,
     range,
+    visible,
     routeFilter,
     historyRevision,
     snapshot.runtime.vpnActive,
@@ -125,23 +129,25 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
   ])
 
   useEffect(() => {
-    if (tab !== 'diagnostics') return
+    if (tab !== 'diagnostics' || !visible || !isDocumentVisible()) return
     let cancelled = false
+    let timer: number | undefined
     const load = async () => {
+      if (cancelled || !isDocumentVisible()) return
       try {
         const entries = await api.getDiagnostics()
-        if (!cancelled) setDiagnostics(entries)
+        if (!cancelled && isDocumentVisible()) setDiagnostics(entries)
       } catch (error) {
-        if (!cancelled) onError(error)
+        if (!cancelled && isDocumentVisible()) onError(error)
       }
+      if (!cancelled && isDocumentVisible()) timer = window.setTimeout(() => void load(), 2000)
     }
     void load()
-    const timer = window.setInterval(() => void load(), 2000)
     return () => {
       cancelled = true
-      window.clearInterval(timer)
+      if (timer) window.clearTimeout(timer)
     }
-  }, [onError, tab])
+  }, [onError, tab, visible])
 
   const max = useMemo(
     () => Math.max(1, ...(report?.bars.flatMap((bar) => [bar.download, bar.upload]) ?? [1])),

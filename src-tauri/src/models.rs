@@ -346,6 +346,43 @@ pub struct LiveSnapshot {
     pub sampled_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveRates {
+    pub active: bool,
+    pub download_rate: u64,
+    pub upload_rate: u64,
+    pub download_total: u64,
+    pub upload_total: u64,
+    pub sampled_at: i64,
+}
+
+#[cfg(test)]
+mod live_rates_tests {
+    use super::LiveRates;
+
+    #[test]
+    fn live_rates_payload_contains_no_connection_rows() {
+        let payload = serde_json::to_value(LiveRates::default()).unwrap();
+        assert_eq!(
+            payload
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "active",
+                "downloadRate",
+                "downloadTotal",
+                "sampledAt",
+                "uploadRate",
+                "uploadTotal",
+            ]
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryBar {

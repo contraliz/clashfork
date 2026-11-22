@@ -20,7 +20,7 @@ npm ci
 npm run build
 ```
 
-The build stages the pinned, checksum-verified Mihomo executable and builds the three Clashfork service binaries before Tauri packages the installer. The expected artifact is `target/release/bundle/nsis/Clashfork_1.0.3_x64-setup.exe`. Installing the bundle requires administrator access to register the fork-owned TUN service.
+The build stages the pinned, checksum-verified Mihomo executable and builds the three Clashfork service binaries before Tauri packages the installer. The expected artifact is `target/release/bundle/nsis/Clashfork_1.0.4_x64-setup.exe`. Installing the bundle requires administrator access to register the fork-owned TUN service.
 
 ## Data and security boundaries
 
