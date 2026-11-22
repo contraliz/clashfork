@@ -1,0 +1,7 @@
+Synthetic notice labels only (no account, email, endpoint or credential values):
+账号信息
+登录账户
+套餐信息
+流量重置 2026-12-01 剩余 64GB
+剩余流量 64GB
+消息: 5条未读，在APP查看

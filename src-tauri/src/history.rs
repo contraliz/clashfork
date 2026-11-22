@@ -1,0 +1,780 @@
+use crate::models::{CustomAppGroup, HistoryBar, HistoryReport, HistoryRow, RouteClass};
+use anyhow::{Context, Result};
+use chrono::{Datelike, Local, TimeZone, Timelike};
+use rusqlite::{Connection, params};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+pub struct HistoryStore {
+    conn: Connection,
+}
+
+impl HistoryStore {
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut conn =
+            Connection::open(path).context("failed to open the traffic history database")?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS minute_totals (
+                minute INTEGER PRIMARY KEY,
+                download INTEGER NOT NULL DEFAULT 0,
+                upload INTEGER NOT NULL DEFAULT 0,
+                gap INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS minute_apps (
+                minute INTEGER NOT NULL,
+                app TEXT NOT NULL,
+                route TEXT NOT NULL,
+                route_class TEXT NOT NULL DEFAULT 'unknown',
+                download INTEGER NOT NULL DEFAULT 0,
+                upload INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (minute, app, route, route_class)
+            );
+            CREATE INDEX IF NOT EXISTS idx_minute_apps_minute ON minute_apps(minute);
+            CREATE TABLE IF NOT EXISTS gap_ranges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER
+            );",
+        )?;
+        migrate_route_class(&mut conn)?;
+        Ok(Self { conn })
+    }
+
+    pub fn record_totals(&mut self, at: i64, download: u64, upload: u64) -> Result<()> {
+        if download == 0 && upload == 0 {
+            return Ok(());
+        }
+        let minute = minute_start(at);
+        self.conn.execute(
+            "INSERT INTO minute_totals(minute, download, upload, gap) VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(minute) DO UPDATE SET
+                download = download + excluded.download,
+                upload = upload + excluded.upload",
+            params![minute, to_i64(download)?, to_i64(upload)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_apps(
+        &mut self,
+        at: i64,
+        flows: &[(String, String, RouteClass, u64, u64)],
+    ) -> Result<()> {
+        if flows.is_empty() {
+            return Ok(());
+        }
+        let minute = minute_start(at);
+        let tx = self.conn.transaction()?;
+        for (app, route, route_class, download, upload) in flows {
+            if *download == 0 && *upload == 0 {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO minute_apps(minute, app, route, route_class, download, upload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(minute, app, route, route_class) DO UPDATE SET
+                    download = download + excluded.download,
+                    upload = upload + excluded.upload",
+                params![minute, app, route, route_class_name(*route_class), to_i64(*download)?, to_i64(*upload)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_gap(&mut self, at: i64) -> Result<()> {
+        let minute = minute_start(at);
+        self.conn.execute(
+            "INSERT INTO minute_totals(minute, download, upload, gap) VALUES (?1, 0, 0, 1)
+             ON CONFLICT(minute) DO UPDATE SET gap = 1",
+            params![minute],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune(&mut self, now: i64) -> Result<()> {
+        let cutoff = now.saturating_sub(30 * 24 * 60 * 60);
+        self.conn.execute(
+            "DELETE FROM minute_totals WHERE minute < ?1",
+            params![cutoff],
+        )?;
+        self.conn
+            .execute("DELETE FROM minute_apps WHERE minute < ?1", params![cutoff])?;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        self.conn.execute("DELETE FROM minute_totals", [])?;
+        self.conn.execute("DELETE FROM minute_apps", [])?;
+        self.conn.execute("DELETE FROM gap_ranges", [])?;
+        Ok(())
+    }
+
+    pub fn report(
+        &self,
+        range: &str,
+        breakdown: &str,
+        groups: &[CustomAppGroup],
+        now: i64,
+    ) -> Result<HistoryReport> {
+        let (from, bar_mode) = range_bounds(range, now)?;
+        let (total_download, total_upload, gap_minutes, bars) =
+            self.totals_and_bars(from, now, bar_mode)?;
+        let rows = self.build_rows(from, now, breakdown, groups, total_download, total_upload)?;
+        Ok(HistoryReport {
+            from,
+            to: now,
+            total_download,
+            total_upload,
+            total: total_download.saturating_add(total_upload),
+            gap_minutes,
+            bars,
+            rows,
+            breakdown: breakdown.to_owned(),
+        })
+    }
+
+    fn totals_and_bars(
+        &self,
+        from: i64,
+        to: i64,
+        bar_mode: BarMode,
+    ) -> Result<(u64, u64, u64, Vec<HistoryBar>)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT minute, download, upload, gap FROM minute_totals WHERE minute >= ?1 AND minute <= ?2 ORDER BY minute",
+        )?;
+        let rows = stmt.query_map(params![from, to], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut totals_down = 0u64;
+        let mut totals_up = 0u64;
+        let mut gaps = 0u64;
+        let mut buckets: BTreeMap<i64, (u64, u64, bool)> = BTreeMap::new();
+        for start in bar_bucket_starts(from, to, bar_mode) {
+            buckets.insert(start, (0, 0, false));
+        }
+        for row in rows {
+            let (minute, down, up, gap) = row?;
+            let down = u64::try_from(down.max(0)).unwrap_or(0);
+            let up = u64::try_from(up.max(0)).unwrap_or(0);
+            totals_down = totals_down.saturating_add(down);
+            totals_up = totals_up.saturating_add(up);
+            if gap != 0 {
+                gaps = gaps.saturating_add(1);
+            }
+            let bucket = bar_bucket_start(minute, bar_mode);
+            let entry = buckets.entry(bucket).or_insert((0, 0, false));
+            entry.0 = entry.0.saturating_add(down);
+            entry.1 = entry.1.saturating_add(up);
+            entry.2 |= gap != 0;
+        }
+        let bars = buckets
+            .into_iter()
+            .map(|(start, (download, upload, gap))| HistoryBar {
+                start,
+                label: bar_label(start, bar_mode),
+                download,
+                upload,
+                gap,
+            })
+            .collect();
+        Ok((totals_down, totals_up, gaps, bars))
+    }
+
+    fn build_rows(
+        &self,
+        from: i64,
+        to: i64,
+        breakdown: &str,
+        groups: &[CustomAppGroup],
+        total_download: u64,
+        total_upload: u64,
+    ) -> Result<Vec<HistoryRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT app, route, route_class, sum(download), sum(upload) FROM minute_apps
+             WHERE minute >= ?1 AND minute <= ?2 GROUP BY app, route, route_class",
+        )?;
+        let raw = stmt.query_map(params![from, to], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut aggregate: BTreeMap<
+            (String, RouteClass),
+            (u64, u64, Option<String>, Option<String>),
+        > = BTreeMap::new();
+        for row in raw {
+            let (app, route, class, down, up) = row?;
+            let route_class = route_class_from_db(&class);
+            let down = u64::try_from(down.max(0)).unwrap_or(0);
+            let up = u64::try_from(up.max(0)).unwrap_or(0);
+            let (label, app_field, route_field) = match breakdown {
+                "customGroup" => {
+                    let group = groups.iter().find(|group| {
+                        group
+                            .apps
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(&app))
+                    });
+                    let label = group
+                        .map(|group| group.name.clone())
+                        .unwrap_or_else(|| app.clone());
+                    let app_field = group.is_none().then_some(app.clone());
+                    (label, app_field, None)
+                }
+                "route" => (route.clone(), None, Some(route.clone())),
+                _ => (app.clone(), Some(app.clone()), None),
+            };
+            let entry =
+                aggregate
+                    .entry((label, route_class))
+                    .or_insert((0, 0, app_field, route_field));
+            entry.0 = entry.0.saturating_add(down);
+            entry.1 = entry.1.saturating_add(up);
+        }
+        let estimated_down: u128 = aggregate.values().map(|value| value.0 as u128).sum();
+        let estimated_up: u128 = aggregate.values().map(|value| value.1 as u128).sum();
+        let mut rows = Vec::new();
+        for ((label, route_class), (down, up, app, route)) in aggregate {
+            let (down, up) =
+                if estimated_down > total_download as u128 || estimated_up > total_upload as u128 {
+                    (
+                        scale_to_total(down, total_download, estimated_down),
+                        scale_to_total(up, total_upload, estimated_up),
+                    )
+                } else {
+                    (down, up)
+                };
+            rows.push(HistoryRow {
+                label,
+                app,
+                route,
+                route_class,
+                download: down,
+                upload: up,
+                total: down.saturating_add(up),
+            });
+        }
+        let attributed_down: u128 = rows.iter().map(|row| row.download as u128).sum();
+        let attributed_up: u128 = rows.iter().map(|row| row.upload as u128).sum();
+        let residual_down = (total_download as u128).saturating_sub(attributed_down);
+        let residual_up = (total_upload as u128).saturating_sub(attributed_up);
+        if residual_down > 0 || residual_up > 0 {
+            let down = u64::try_from(residual_down).unwrap_or(u64::MAX);
+            let up = u64::try_from(residual_up).unwrap_or(u64::MAX);
+            if let Some(row) = rows.iter_mut().find(|row| {
+                row.label == "Unattributed"
+                    && row.app.is_none()
+                    && row.route_class == RouteClass::Unknown
+                    && (breakdown != "route" || row.route.as_deref() == Some("Unattributed"))
+            }) {
+                row.download = row.download.saturating_add(down);
+                row.upload = row.upload.saturating_add(up);
+                row.total = row.download.saturating_add(row.upload);
+            } else {
+                rows.push(HistoryRow {
+                    label: "Unattributed".to_owned(),
+                    app: None,
+                    route: if breakdown == "route" {
+                        Some("Unattributed".to_owned())
+                    } else {
+                        None
+                    },
+                    route_class: RouteClass::Unknown,
+                    download: down,
+                    upload: up,
+                    total: down.saturating_add(up),
+                });
+            }
+        }
+        rows.sort_by(|left, right| {
+            right
+                .total
+                .cmp(&left.total)
+                .then(left.label.cmp(&right.label))
+        });
+        Ok(rows)
+    }
+}
+
+fn migrate_route_class(conn: &mut Connection) -> Result<()> {
+    let has_route_class = {
+        let mut statement = conn.prepare("PRAGMA table_info(minute_apps)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "route_class")
+    };
+    if has_route_class {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_minute_apps_minute;
+         ALTER TABLE minute_apps RENAME TO minute_apps_legacy;
+         CREATE TABLE minute_apps (
+             minute INTEGER NOT NULL,
+             app TEXT NOT NULL,
+             route TEXT NOT NULL,
+             route_class TEXT NOT NULL DEFAULT 'unknown',
+             download INTEGER NOT NULL DEFAULT 0,
+             upload INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (minute, app, route, route_class)
+         );
+         INSERT INTO minute_apps(minute, app, route, route_class, download, upload)
+         SELECT minute, app, route,
+             CASE lower(trim(route))
+                 WHEN 'direct' THEN 'direct'
+                 WHEN 'blocked' THEN 'blocked'
+                 WHEN 'reject' THEN 'blocked'
+                 WHEN '' THEN 'unknown'
+                 WHEN 'unknown' THEN 'unknown'
+                 WHEN 'unattributed' THEN 'unknown'
+                 ELSE 'proxy'
+             END,
+             download, upload
+         FROM minute_apps_legacy;
+         DROP TABLE minute_apps_legacy;
+         CREATE INDEX idx_minute_apps_minute ON minute_apps(minute);",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn route_class_name(class: RouteClass) -> &'static str {
+    match class {
+        RouteClass::Proxy => "proxy",
+        RouteClass::Direct => "direct",
+        RouteClass::Blocked => "blocked",
+        RouteClass::Unknown => "unknown",
+    }
+}
+
+fn route_class_from_db(class: &str) -> RouteClass {
+    match class {
+        "proxy" => RouteClass::Proxy,
+        "direct" => RouteClass::Direct,
+        "blocked" => RouteClass::Blocked,
+        _ => RouteClass::Unknown,
+    }
+}
+
+fn scale_to_total(value: u64, total: u64, estimated: u128) -> u64 {
+    if estimated == 0 {
+        return 0;
+    }
+    let scaled = (value as u128).saturating_mul(total as u128) / estimated;
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+fn to_i64(value: u64) -> Result<i64> {
+    i64::try_from(value).context("traffic counter overflowed the local history")
+}
+
+fn minute_start(timestamp: i64) -> i64 {
+    timestamp - timestamp.rem_euclid(60)
+}
+
+#[derive(Clone, Copy)]
+enum BarMode {
+    Hour,
+    Day,
+}
+
+fn range_bounds(range: &str, now: i64) -> Result<(i64, BarMode)> {
+    let local = Local
+        .timestamp_opt(now, 0)
+        .single()
+        .unwrap_or_else(Local::now);
+    let today = Local
+        .with_ymd_and_hms(local.year(), local.month(), local.day(), 0, 0, 0)
+        .single()
+        .unwrap_or(local)
+        .timestamp();
+    match range {
+        "today" => Ok((today, BarMode::Hour)),
+        "7d" => Ok((today - 6 * 86_400, BarMode::Day)),
+        "30d" => Ok((today - 29 * 86_400, BarMode::Day)),
+        _ => anyhow::bail!("unsupported history range"),
+    }
+}
+
+fn bar_bucket_start(timestamp: i64, mode: BarMode) -> i64 {
+    let local = Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .unwrap_or_else(Local::now);
+    match mode {
+        BarMode::Hour => Local
+            .with_ymd_and_hms(local.year(), local.month(), local.day(), local.hour(), 0, 0)
+            .single()
+            .unwrap_or(local)
+            .timestamp(),
+        BarMode::Day => Local
+            .with_ymd_and_hms(local.year(), local.month(), local.day(), 0, 0, 0)
+            .single()
+            .unwrap_or(local)
+            .timestamp(),
+    }
+}
+
+fn bar_bucket_starts(from: i64, to: i64, mode: BarMode) -> Vec<i64> {
+    let start = bar_bucket_start(from, mode);
+    let end = bar_bucket_start(to, mode);
+    let mut result = Vec::new();
+    let step = match mode {
+        BarMode::Hour => 3_600,
+        BarMode::Day => 86_400,
+    };
+    let mut cursor = start;
+    while cursor <= end {
+        result.push(cursor);
+        cursor = cursor.saturating_add(step);
+    }
+    result
+}
+
+fn bar_label(start: i64, mode: BarMode) -> String {
+    let local = Local
+        .timestamp_opt(start, 0)
+        .single()
+        .unwrap_or_else(Local::now);
+    match mode {
+        BarMode::Hour => local.format("%H:%M").to_string(),
+        BarMode::Day => local.format("%b %-d").to_string(),
+    }
+}
+
+pub fn retention_cutoff(now: i64) -> i64 {
+    now.saturating_sub(30 * 24 * 60 * 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory() -> HistoryStore {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE minute_totals (
+                minute INTEGER PRIMARY KEY,
+                download INTEGER NOT NULL DEFAULT 0,
+                upload INTEGER NOT NULL DEFAULT 0,
+                gap INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE minute_apps (
+                minute INTEGER NOT NULL,
+                app TEXT NOT NULL,
+                route TEXT NOT NULL,
+                route_class TEXT NOT NULL DEFAULT 'unknown',
+                download INTEGER NOT NULL DEFAULT 0,
+                upload INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (minute, app, route, route_class)
+            );
+            CREATE TABLE gap_ranges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER
+            );",
+        )
+        .unwrap();
+        HistoryStore { conn }
+    }
+
+    #[test]
+    fn totals_are_authoritative_and_residual_is_unattributed() {
+        let mut history = memory();
+        let now = Local::now().timestamp();
+        history.record_totals(now, 1_000, 400).unwrap();
+        history
+            .record_apps(
+                now,
+                &[(
+                    "ChatGPT.exe".into(),
+                    "Singapore".into(),
+                    RouteClass::Proxy,
+                    600,
+                    100,
+                )],
+            )
+            .unwrap();
+        let report = history.report("today", "app", &[], now).unwrap();
+        assert_eq!(report.total_download, 1_000);
+        assert_eq!(report.total_upload, 400);
+        let rows_total: u64 = report.rows.iter().map(|row| row.total).sum();
+        assert_eq!(rows_total, report.total);
+        assert!(report.rows.iter().any(|row| row.label == "Unattributed"));
+    }
+
+    #[test]
+    fn overflow_is_scaled_to_authoritative_total() {
+        let mut history = memory();
+        let now = Local::now().timestamp();
+        history.record_totals(now, 100, 50).unwrap();
+        history
+            .record_apps(
+                now,
+                &[
+                    ("A".into(), "Direct".into(), RouteClass::Direct, 500, 100),
+                    ("B".into(), "Node".into(), RouteClass::Proxy, 500, 100),
+                ],
+            )
+            .unwrap();
+        let report = history.report("today", "app", &[], now).unwrap();
+        assert_eq!(report.rows.iter().map(|row| row.download).sum::<u64>(), 100);
+        assert_eq!(report.rows.iter().map(|row| row.upload).sum::<u64>(), 50);
+    }
+
+    #[test]
+    fn gap_and_custom_group_are_retroactive() {
+        let mut history = memory();
+        let now = Local::now().timestamp();
+        history.record_totals(now, 10, 10).unwrap();
+        history
+            .record_apps(
+                now,
+                &[(
+                    "codex.exe".into(),
+                    "Direct".into(),
+                    RouteClass::Direct,
+                    10,
+                    10,
+                )],
+            )
+            .unwrap();
+        history.mark_gap(now).unwrap();
+        let groups = vec![CustomAppGroup {
+            id: "g".into(),
+            name: "AI".into(),
+            apps: vec!["codex.exe".into()],
+        }];
+        let report = history
+            .report("today", "customGroup", &groups, now)
+            .unwrap();
+        assert!(report.rows.iter().any(|row| row.label == "AI"));
+        assert_eq!(report.gap_minutes, 1);
+        assert!(report.bars.iter().any(|bar| bar.gap));
+    }
+
+    #[test]
+    fn retention_removes_old_minutes() {
+        let mut history = memory();
+        let now = Local::now().timestamp();
+        history.record_totals(now - 40 * 86_400, 10, 10).unwrap();
+        history.record_totals(now, 20, 20).unwrap();
+        history.prune(now).unwrap();
+        let count: i64 = history
+            .conn
+            .query_row("SELECT count(*) FROM minute_totals", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn zero_and_duplicate_deltas_do_not_double_count() {
+        let mut history = memory();
+        let now = Local::now().timestamp();
+        history.record_totals(now, 0, 0).unwrap();
+        history.record_totals(now, 7, 3).unwrap();
+        history.record_totals(now, 0, 0).unwrap();
+        let report = history.report("today", "app", &[], now).unwrap();
+        assert_eq!(report.total_download, 7);
+        assert_eq!(report.total_upload, 3);
+    }
+
+    #[test]
+    fn mixed_route_classes_remain_distinct_for_apps_groups_and_route_details() {
+        let mut history = memory();
+        let now = Local::now().timestamp();
+        history.record_totals(now, 1_000, 500).unwrap();
+        history
+            .record_apps(
+                now,
+                &[
+                    (
+                        "ChatGPT.exe".into(),
+                        "Falemon / Hong Kong".into(),
+                        RouteClass::Proxy,
+                        100,
+                        40,
+                    ),
+                    (
+                        "ChatGPT.exe".into(),
+                        "Direct".into(),
+                        RouteClass::Direct,
+                        200,
+                        100,
+                    ),
+                    (
+                        "ChatGPT.exe".into(),
+                        "Blocked".into(),
+                        RouteClass::Blocked,
+                        50,
+                        20,
+                    ),
+                    (
+                        "ChatGPT.exe".into(),
+                        "Unknown chain".into(),
+                        RouteClass::Unknown,
+                        25,
+                        10,
+                    ),
+                    (
+                        "Other.exe".into(),
+                        "Falemon / Hong Kong".into(),
+                        RouteClass::Proxy,
+                        100,
+                        40,
+                    ),
+                ],
+            )
+            .unwrap();
+        let groups = vec![CustomAppGroup {
+            id: "ai".into(),
+            name: "AI tools".into(),
+            apps: vec!["ChatGPT.exe".into()],
+        }];
+
+        let app = history.report("today", "app", &groups, now).unwrap();
+        assert_eq!(app.rows.iter().map(|row| row.download).sum::<u64>(), 1_000);
+        assert_eq!(app.rows.iter().map(|row| row.upload).sum::<u64>(), 500);
+        for class in [
+            RouteClass::Proxy,
+            RouteClass::Direct,
+            RouteClass::Blocked,
+            RouteClass::Unknown,
+        ] {
+            assert!(
+                app.rows
+                    .iter()
+                    .any(|row| row.label == "ChatGPT.exe" && row.route_class == class)
+            );
+        }
+        assert!(
+            app.rows
+                .iter()
+                .any(|row| row.label == "Unattributed" && row.route_class == RouteClass::Unknown)
+        );
+
+        let grouped = history
+            .report("today", "customGroup", &groups, now)
+            .unwrap();
+        assert_eq!(
+            grouped.rows.iter().map(|row| row.download).sum::<u64>(),
+            1_000
+        );
+        assert_eq!(grouped.rows.iter().map(|row| row.upload).sum::<u64>(), 500);
+        assert!(
+            grouped
+                .rows
+                .iter()
+                .any(|row| row.label == "AI tools" && row.route_class == RouteClass::Proxy)
+        );
+        assert!(
+            grouped
+                .rows
+                .iter()
+                .any(|row| row.label == "AI tools" && row.route_class == RouteClass::Direct)
+        );
+
+        let routes = history.report("today", "route", &groups, now).unwrap();
+        assert_eq!(
+            routes.rows.iter().map(|row| row.download).sum::<u64>(),
+            1_000
+        );
+        assert_eq!(routes.rows.iter().map(|row| row.upload).sum::<u64>(), 500);
+        assert!(
+            routes
+                .rows
+                .iter()
+                .any(|row| row.label == "Falemon / Hong Kong"
+                    && row.route_class == RouteClass::Proxy)
+        );
+        assert!(
+            routes
+                .rows
+                .iter()
+                .any(|row| row.label == "Direct" && row.route_class == RouteClass::Direct)
+        );
+        assert!(
+            routes
+                .rows
+                .iter()
+                .any(|row| row.label == "Blocked" && row.route_class == RouteClass::Blocked)
+        );
+        assert!(
+            routes
+                .rows
+                .iter()
+                .any(|row| row.label == "Unknown chain" && row.route_class == RouteClass::Unknown)
+        );
+        assert!(
+            routes
+                .rows
+                .iter()
+                .any(|row| row.label == "Unattributed" && row.route_class == RouteClass::Unknown)
+        );
+    }
+
+    #[test]
+    fn legacy_rows_migrate_without_losing_totals_or_route_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE minute_totals (minute INTEGER PRIMARY KEY, download INTEGER NOT NULL, upload INTEGER NOT NULL, gap INTEGER NOT NULL);
+             CREATE TABLE minute_apps (minute INTEGER NOT NULL, app TEXT NOT NULL, route TEXT NOT NULL, download INTEGER NOT NULL, upload INTEGER NOT NULL, PRIMARY KEY (minute, app, route));
+             INSERT INTO minute_totals VALUES (1799999940, 100, 40, 0);
+             INSERT INTO minute_apps VALUES (1799999940, 'A.exe', 'Direct', 10, 4);
+             INSERT INTO minute_apps VALUES (1799999940, 'B.exe', 'Blocked', 20, 8);
+             INSERT INTO minute_apps VALUES (1799999940, 'C.exe', 'Unattributed', 5, 2);
+             INSERT INTO minute_apps VALUES (1799999940, 'D.exe', 'Falemon / Hong Kong', 30, 12);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let history = HistoryStore::open(&path).unwrap();
+        let report = history
+            .report("today", "route", &[], 1_800_000_000)
+            .unwrap();
+        assert_eq!(report.total_download, 100);
+        assert_eq!(report.total_upload, 40);
+        assert!(
+            report
+                .rows
+                .iter()
+                .any(|row| row.label == "Direct" && row.route_class == RouteClass::Direct)
+        );
+        assert!(
+            report
+                .rows
+                .iter()
+                .any(|row| row.label == "Blocked" && row.route_class == RouteClass::Blocked)
+        );
+        assert!(
+            report
+                .rows
+                .iter()
+                .any(|row| row.label == "Unattributed" && row.route_class == RouteClass::Unknown)
+        );
+        assert!(
+            report
+                .rows
+                .iter()
+                .any(|row| row.label == "Falemon / Hong Kong"
+                    && row.route_class == RouteClass::Proxy)
+        );
+    }
+}

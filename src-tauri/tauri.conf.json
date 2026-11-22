@@ -1,63 +1,62 @@
 {
-  "version": "2.5.10",
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Clashfork",
+  "version": "1.0.2",
+  "identifier": "io.clashfork.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run prepare:bundle && npm run build:web",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Clashfork",
+        "width": 1180,
+        "height": 820,
+        "minWidth": 760,
+        "minHeight": 560,
+        "decorations": false,
+        "resizable": true,
+        "center": true,
+        "visible": true,
+        "backgroundColor": "#f7f8f5"
+      }
+    ],
+    "security": {
+      "capabilities": ["main"],
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; connect-src ipc: http://ipc.localhost; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'"
+    }
+  },
   "bundle": {
     "active": true,
-    "longDescription": "Clash Verge Rev",
+    "targets": ["nsis"],
+    "publisher": "Clashfork",
+    "copyright": "Clashfork contributors. GPL-3.0-only; based on Clash Verge Rev.",
+    "shortDescription": "Clashfork TUN desktop client",
+    "longDescription": "Windows TUN-only desktop client for stock Mihomo with local routing, subscriptions, history and diagnostics.",
+    "category": "Utility",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico",
-      "icons/Assets.car"
+      "icons/icon.ico"
     ],
     "resources": ["resources"],
-    "publisher": "Clash Verge Rev",
-    "externalBin": ["sidecar/verge-mihomo", "sidecar/verge-mihomo-alpha"],
-    "copyright": "GNU General Public License v3.0",
-    "category": "DeveloperTool",
-    "shortDescription": "Clash Verge Rev",
-    "createUpdaterArtifacts": true
-  },
-  "build": {
-    "beforeBuildCommand": "pnpm run web:build",
-    "frontendDist": "../dist",
-    "beforeDevCommand": "pnpm run web:dev",
-    "devUrl": "http://localhost:3000/",
-    "removeUnusedCommands": true
-  },
-  "productName": "Clash Verge",
-  "identifier": "io.github.clash-verge-rev.clash-verge-rev",
-  "plugins": {
-    "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQyOEMyRjBCQkVGOUJEREYKUldUZnZmbStDeStNMHU5Mmo1N24xQXZwSVRYbXA2NUpzZE5oVzlqeS9Bc0t6RVV4MmtwVjBZaHgK",
-      "endpoints": [
-        "https://update.hwdns.net/https://github.com/clash-verge-rev/clash-verge-rev/releases/download/updater/update-proxy.json",
-        "https://gh-proxy.org/https://github.com/clash-verge-rev/clash-verge-rev/releases/download/updater/update-proxy.json",
-        "https://github.com/clash-verge-rev/clash-verge-rev/releases/download/updater/update.json"
-      ],
-      "windows": {
-        "installMode": "passive"
-      }
-    },
-    "deep-link": {
-      "desktop": {
-        "schemes": ["clash", "clash-verge"]
-      }
-    }
-  },
-  "app": {
-    "security": {
-      "capabilities": ["desktop-capability", "migrated"],
-      "assetProtocol": {
-        "enable": true,
-        "scope": {
-          "allow": ["**"],
-          "requireLiteralLeadingDot": false
-        }
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
       },
-      "csp": null
+      "nsis": {
+        "installMode": "perMachine",
+        "displayLanguageSelector": false,
+        "languages": ["English"],
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "./windows/installer-hooks.nsh"
+      }
     }
   }
 }
