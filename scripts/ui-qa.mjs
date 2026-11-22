@@ -60,6 +60,24 @@ try {
   assert.match(await page.title(), /Clashfork/)
   assert.match(await page.locator('#root').innerText(), /Dashboard/)
   assert.equal(await page.getByText(/Vite|Webpack|Next\.js.*error/i).count(), 0)
+
+  await page.keyboard.press('Tab')
+  const focus = await page.evaluate(() => {
+    const element = document.activeElement
+    if (!(element instanceof HTMLElement)) return null
+    const style = getComputedStyle(element)
+    return {
+      tag: element.tagName,
+      focusVisible: element.matches(':focus-visible'),
+      outlineStyle: style.outlineStyle,
+      outlineWidth: style.outlineWidth,
+    }
+  })
+  assert.ok(focus && focus.tag !== 'BODY', 'Tab must move focus into the app')
+  assert.equal(focus.focusVisible, true, 'keyboard focus must use :focus-visible')
+  assert.notEqual(focus.outlineStyle, 'none', 'focused control must show an outline')
+  assert.notEqual(focus.outlineWidth, '0px', 'focused control must show an outline width')
+
   const vpn = page.getByRole('switch', { name: 'VPN connection' })
   await vpn.click()
   await heading('Connected').waitFor()
@@ -109,23 +127,272 @@ try {
   const unattributedRow = historyTable.locator('tbody tr').filter({ has: page.getByText('Unattributed', { exact: true }) })
   await unattributedRow.locator('.route-class-unknown').waitFor()
   await historyTable.getByText('Falemon / Singapore I0', { exact: true }).waitFor()
+  const routeFilter = page.getByLabel('Route', { exact: true })
+  const subjectFilter = page.getByLabel('App or group', { exact: true })
+  const assertHistoryAccounting = async () => {
+    await page.locator('.bar-group').first().waitFor()
+    await page.waitForFunction(() => !document.querySelector('.chart-loading'))
+    const totals = await page.locator('.metric-panel').evaluate((panel) => ({
+      download: Number(panel.getAttribute('data-history-total-download')),
+      upload: Number(panel.getAttribute('data-history-total-upload')),
+    }))
+    const rows = await page.locator('.history-table tr[data-history-row-download]').evaluateAll((items) => items.map((item) => ({
+      download: Number(item.getAttribute('data-history-row-download')),
+      upload: Number(item.getAttribute('data-history-row-upload')),
+    })))
+    const bars = await page.locator('.bar-group').evaluateAll((items) => items.map((item) => ({
+      download: Number(item.getAttribute('data-history-bar-download')),
+      upload: Number(item.getAttribute('data-history-bar-upload')),
+    })))
+    assert.equal(rows.reduce((sum, item) => sum + item.download, 0), totals.download, 'history rows must match filtered download totals')
+    assert.equal(rows.reduce((sum, item) => sum + item.upload, 0), totals.upload, 'history rows must match filtered upload totals')
+    assert.equal(bars.reduce((sum, item) => sum + item.download, 0), totals.download, 'history bars must match filtered download totals')
+    assert.equal(bars.reduce((sum, item) => sum + item.upload, 0), totals.upload, 'history bars must match filtered upload totals')
+  }
+
+  await assertHistoryAccounting()
+  await routeFilter.focus()
+  await page.keyboard.press('Tab')
+  await page.keyboard.press('Tab')
+  assert.equal(await page.evaluate(() => document.activeElement?.classList.contains('bar-group')), true, 'chart periods must be keyboard reachable')
+  const periodInspector = page.locator('.bar-period-inspector')
+  let periodDetails = await periodInspector.innerText()
+  assert.match(periodDetails, /Download/)
+  assert.match(periodDetails, /Upload/)
+  assert.match(periodDetails, /No recording gap/)
+  assert.ok(await periodInspector.locator('strong').innerText(), 'period details must include a date')
+  await page.locator('.bar-group').first().hover()
+  assert.match(await page.locator('.bar-group').first().getAttribute('aria-label'), /Download .* Upload .* recording gap/i)
+  await page.getByRole('button', { name: '30 days', exact: true }).click()
+  const gapPeriod = page.locator('.bar-group[data-history-bar-gap="true"]').first()
+  await gapPeriod.waitFor()
+  await gapPeriod.hover()
+  await periodInspector.getByText('Recording gap', { exact: true }).waitFor()
+  periodDetails = await periodInspector.innerText()
+  assert.match(periodDetails, /Download/)
+  assert.match(periodDetails, /Upload/)
+  assert.ok(await periodInspector.locator('strong').innerText(), 'gap details must include a date')
+  await assertHistoryAccounting()
+
+  await routeFilter.selectOption('proxy')
+  await page.getByLabel('Breakdown').selectOption('customGroup')
+  await page.waitForFunction(() => {
+    const classes = [...document.querySelectorAll('.history-table .route-class')]
+    return classes.length > 0 && classes.every((item) => item.classList.contains('route-class-proxy'))
+  })
+  assert.equal(await routeFilter.inputValue(), 'proxy', 'breakdown changes must preserve route filters')
+  await assertHistoryAccounting()
+  await subjectFilter.selectOption({ label: 'Development' })
+  await page.waitForFunction(() => {
+    const rows = [...document.querySelectorAll('.history-table tr[data-history-row-download]')]
+    return rows.length === 1 && rows[0].querySelector('strong')?.textContent === 'Development' && rows[0].querySelector('.route-class-proxy')
+  })
+  assert.equal(await routeFilter.inputValue(), 'proxy', 'app-group and route filters must compose')
+  await assertHistoryAccounting()
+  await page.getByRole('button', { name: 'Today', exact: true }).click()
+  assert.equal(await routeFilter.inputValue(), 'proxy', 'range changes must preserve route filters')
+  assert.ok(await subjectFilter.inputValue(), 'range changes must preserve app-group filters')
+  await page.locator('.history-table').getByText('Development', { exact: true }).waitFor()
+
+  await routeFilter.selectOption('direct')
+  await page.getByRole('heading', { name: 'No traffic matches these filters', exact: true }).waitFor()
+  assert.equal(await page.locator('.metric-panel').getAttribute('data-history-total'), '0')
+  assert.ok((await subjectFilter.locator('option').allTextContents()).includes('steam.exe'), 'app choices must remain available when filters match no traffic')
+  await assertHistoryAccounting()
+  await capture('history-no-match')
+
+  await subjectFilter.selectOption({ label: 'AI tools' })
+  await page.locator('.history-table').getByText('AI tools', { exact: true }).waitFor()
+  await page.locator('.history-table .route-class-direct').first().waitFor()
+  await capture('history-filtered')
+  await page.getByLabel('Breakdown').selectOption('app')
+  await page.locator('.history-table').getByText('ChatGPT.exe', { exact: true }).waitFor()
+  assert.equal(await routeFilter.inputValue(), 'direct')
+  await assertHistoryAccounting()
+
+  await subjectFilter.selectOption({ label: 'steam.exe' })
+  await page.locator('.history-table').getByText('steam.exe', { exact: true }).waitFor()
+  await routeFilter.selectOption('proxy')
+  await page.getByRole('heading', { name: 'No traffic matches these filters', exact: true }).waitFor()
+  assert.ok((await subjectFilter.locator('option').allTextContents()).includes('steam.exe'))
+  await page.getByRole('button', { name: 'Reset filters', exact: true }).first().click()
+  assert.equal(await routeFilter.inputValue(), 'all')
+  assert.equal(await subjectFilter.inputValue(), 'all')
+  await page.getByLabel('Breakdown').selectOption('app')
+  await page.locator('.history-table').getByText('Unattributed', { exact: true }).waitFor()
+  await page.getByRole('button', { name: '7 days', exact: true }).click()
+  await assertHistoryAccounting()
   await capture('logs')
   await page.getByRole('tab', { name: 'Diagnostics', exact: true }).click()
   await page.getByText('Live diagnostics', { exact: true }).waitFor()
+  await page.locator('.diagnostic-line').first().waitFor()
+  const diagnosticOrder = async () => page.locator('.diagnostic-line').evaluateAll((lines) =>
+    lines.map((line) => ({
+      id: Number(line.getAttribute('data-diagnostic-id')),
+      at: Number(line.getAttribute('data-diagnostic-at')),
+    })),
+  )
+  const assertNewestFirst = (entries) => {
+    const expected = [...entries].sort((left, right) => right.at - left.at || right.id - left.id)
+    assert.deepEqual(entries, expected, 'diagnostics must be newest first with ID tie breaks')
+  }
+  const initialDiagnostics = await diagnosticOrder()
+  assert.ok(initialDiagnostics.length >= 2, 'fixture diagnostics must render')
+  assertNewestFirst(initialDiagnostics)
+  assert.equal(initialDiagnostics[0].at, initialDiagnostics[1].at, 'fixture includes an equal-second pair')
+  assert.ok(initialDiagnostics[0].id > initialDiagnostics[1].id, 'equal seconds break by newest ID')
+  assert.match(await page.locator('.diagnostic-line').first().innerText(), /Northwind refresh failed/)
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await page.waitForTimeout(250)
+  assertNewestFirst(await diagnosticOrder())
+  await page.waitForTimeout(2300)
+  assertNewestFirst(await diagnosticOrder())
+  await capture('diagnostics')
 
-  await open('Dashboard')
-  for (const screen of ['Dashboard', 'Nodes', 'Rulesets', 'Live Connections', 'Logs']) {
-    await open(screen)
-    await page.setViewportSize({ width: 800, height: 640 })
-    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${screen} overflows at 800x640`)
-    if (screen === 'Dashboard' && screenshotDirectory) {
-      await page.screenshot({ path: join(screenshotDirectory, 'dashboard-800.png') })
+  const viewports = [
+    { name: '800x640', width: 800, height: 640 },
+    { name: '1280x800', width: 1280, height: 800 },
+    { name: '1920x1000', width: 1920, height: 1000 },
+    { name: '2560x1375', width: 2560, height: 1375 },
+  ]
+  const screens = ['Dashboard', 'Nodes', 'Rulesets', 'Live Connections', 'Logs']
+  for (const screen of screens) {
+    for (const viewport of viewports) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height })
+      await open(screen)
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${screen} overflows at ${viewport.name}`)
+      const shell = await page.evaluate(() => ({
+        sidebarWidth: Math.round(document.querySelector('.sidebar').getBoundingClientRect().width),
+        mainWidth: Math.round(document.querySelector('.main').getBoundingClientRect().width),
+        pageWidth: Math.round(document.querySelector('.page').getBoundingClientRect().width),
+        pageRight: Math.round(document.querySelector('.page').getBoundingClientRect().right),
+        navCount: document.querySelectorAll('.nav-item').length,
+      }))
+      assert.equal(shell.sidebarWidth, viewport.width <= 900 ? 62 : 180, `${screen} sidebar must match the responsive rail at ${viewport.name}`)
+      assert.equal(shell.navCount, 5, `${screen} navigation must remain available at ${viewport.name}`)
+      assert.ok(shell.pageRight <= viewport.width, `${screen} content must stay within the window at ${viewport.name}`)
+      if (viewport.width >= 1920) {
+        assert.ok(shell.pageWidth >= 1600, `${screen} should use the wide content pane at ${viewport.name}`)
+      }
+
+      if (screen === 'Dashboard') {
+        const cards = await page.evaluate(() => {
+          const vpn = document.querySelector('.vpn-panel').getBoundingClientRect()
+          const vpnHeading = document.querySelector('.vpn-heading').getBoundingClientRect()
+          const vpnToggle = document.querySelector('.vpn-heading .toggle').getBoundingClientRect()
+          const vpnControls = document.querySelector('.control-row').getBoundingClientRect()
+          const destination = document.querySelector('.picker-field').getBoundingClientRect()
+          const traffic = document.querySelector('.traffic-panel').getBoundingClientRect()
+          const presets = document.querySelector('.run-configs').getBoundingClientRect()
+          const line = document.querySelector('.chart-download')?.getAttribute('d') ?? ''
+          const sampleXs = [...line.matchAll(/(?:M|L)\s+([\d.]+)/g)].map((match) => Number(match[1]))
+          return {
+            vpnTop: vpn.top,
+            vpnBottom: vpn.bottom,
+            vpnWidth: vpn.width,
+            vpnRight: vpn.right,
+            vpnHeadingBottom: vpnHeading.bottom,
+            vpnToggleRight: vpnToggle.right,
+            vpnControlsTop: vpnControls.top,
+            destinationWidth: destination.width,
+            trafficTop: traffic.top,
+            trafficBottom: traffic.bottom,
+            trafficWidth: traffic.width,
+            presetsTop: presets.top,
+            presetsBottom: presets.bottom,
+            sampleXs,
+            hasArea: Boolean(document.querySelector('.chart-area')),
+            markerXs: [...document.querySelectorAll('.chart-point')].map((point) => Number(point.getAttribute('cx'))),
+          }
+        })
+        assert.ok(cards.vpnTop < cards.trafficTop && cards.trafficTop < cards.presetsTop, `Dashboard must stack VPN, live traffic, and saved configurations at ${viewport.name}`)
+        assert.ok(Math.abs(cards.vpnWidth - cards.trafficWidth) < 4, `Dashboard sections must use the same full-width pane at ${viewport.name}`)
+        assert.ok(cards.vpnControlsTop >= cards.vpnHeadingBottom, `VPN mode and destination must sit below status and toggle at ${viewport.name}`)
+        assert.ok(cards.vpnToggleRight <= cards.vpnRight - 12, `VPN toggle must stay inside the status header at ${viewport.name}`)
+        if (viewport.width >= 1600) assert.ok(cards.destinationWidth <= 980, `Wide Dashboard destination field must remain bounded at ${viewport.name}`)
+        if (cards.sampleXs.length < 2) {
+          assert.equal(cards.hasArea, false, `A sparse live sample must not fill the entire chart at ${viewport.name}`)
+          assert.equal(cards.markerXs.length, cards.sampleXs.length * 2, `Sparse live samples must remain visible as points for both directions at ${viewport.name}`)
+          if (cards.markerXs.length > 0) assert.ok(cards.markerXs.every((x) => x >= 790), `Sparse live samples must appear at the recent edge at ${viewport.name}`)
+        } else {
+          assert.equal(cards.hasArea, true, `Multiple live samples should draw a chart area at ${viewport.name}`)
+          assert.ok(cards.sampleXs[0] > 0 && cards.sampleXs.at(-1) >= 790, `Live samples must follow their recent time range at ${viewport.name}`)
+        }
+        if (viewport.width >= 1920) assert.ok(cards.presetsBottom < viewport.height, `Dashboard run configurations should fit in the first viewport at ${viewport.name}`)
+      }
+
+      if (screen === 'Rulesets') {
+        const editor = page.locator('.ruleset-detail')
+        await editor.waitFor()
+        assert.ok(await page.getByRole('button', { name: 'New ruleset', exact: true }).isVisible(), `Ruleset header actions must remain visible at ${viewport.name}`)
+        const editorRect = await editor.boundingBox()
+        assert.ok(editorRect.width > 260, `Ruleset details must retain usable width at ${viewport.name}`)
+      }
+
+      if (screen === 'Logs') {
+        assert.ok(await page.getByLabel('Route', { exact: true }).isVisible(), `History route filter must remain visible at ${viewport.name}`)
+        assert.ok(await page.getByLabel('App or group', { exact: true }).isVisible(), `History app filter must remain visible at ${viewport.name}`)
+        const historyLayout = await page.evaluate(() => {
+          const toolbar = document.querySelector('.history-toolbar-panel').getBoundingClientRect()
+          const route = document.querySelector('[aria-label="Route"]').getBoundingClientRect()
+          const app = document.querySelector('[aria-label="App or group"]').getBoundingClientRect()
+          const summary = document.querySelector('.metric-panel').getBoundingClientRect()
+          const chart = document.querySelector('.chart-panel').getBoundingClientRect()
+          return { toolbarWidth: toolbar.width, routeWidth: route.width, appWidth: app.width, summaryTop: summary.top, summaryBottom: summary.bottom, summaryWidth: summary.width, chartTop: chart.top, chartWidth: chart.width }
+        })
+        assert.ok(historyLayout.summaryBottom < historyLayout.chartTop, `Traffic summary must sit above the chart at ${viewport.name}`)
+        assert.ok(Math.abs(historyLayout.summaryWidth - historyLayout.chartWidth) < 4, `Traffic summary and chart must share the full-width pane at ${viewport.name}`)
+        if (viewport.width >= 1600) {
+          assert.ok(historyLayout.routeWidth <= 240 && historyLayout.appWidth <= 500, `Wide history filters must stay bounded inside their toolbar at ${viewport.name}`)
+          assert.ok(historyLayout.toolbarWidth < 2000, `History controls should remain within the intentional pane width at ${viewport.name}`)
+        }
+        await page.getByRole('tab', { name: 'Diagnostics', exact: true }).click()
+        await page.locator('.diagnostics-panel').waitFor()
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `Diagnostics must not overflow at ${viewport.name}`)
+        await page.getByRole('tab', { name: 'Traffic History', exact: true }).click()
+      }
+
+      const greenElements = await page.evaluate(() => {
+        const parse = (value) => {
+          const match = value.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/)
+          if (!match) return null
+          const alpha = match[4] === undefined ? 1 : Number(match[4])
+          return alpha > 0.1 ? [Number(match[1]), Number(match[2]), Number(match[3])] : null
+        }
+        const greenish = (value) => {
+          const rgb = parse(value)
+          return Boolean(rgb && rgb[1] > 90 && rgb[1] > rgb[0] * 1.25 && rgb[1] > rgb[2] * 1.25)
+        }
+        return [...document.querySelectorAll('*')]
+          .filter((element) => {
+            const style = getComputedStyle(element)
+            if (style.display === 'none' || style.visibility === 'hidden') return false
+            return [
+              style.color,
+              style.backgroundColor,
+              style.borderTopColor,
+              style.borderRightColor,
+              style.borderBottomColor,
+              style.borderLeftColor,
+              style.fill,
+              style.stroke,
+            ].some(greenish)
+          })
+          .map((element) => `${element.tagName.toLowerCase()}.${element.className}`)
+          .slice(0, 5)
+      })
+      assert.deepEqual(greenElements, [], `${screen} must not use green UI colors at ${viewport.name}`)
+      if (screenshotDirectory && (viewport.name === '800x640' || viewport.name === '1920x1000' || (screen === 'Dashboard' && viewport.name === '2560x1375'))) {
+        const slug = screen.toLowerCase().replaceAll(' ', '-')
+        await page.mouse.move(viewport.width - 10, viewport.height - 10)
+        await page.waitForTimeout(150)
+        await page.screenshot({ path: join(screenshotDirectory, `${slug}-${viewport.name}.png`) })
+      }
     }
-    await page.setViewportSize({ width: 1280, height: 800 })
   }
   assert.deepEqual(errors, [])
   assert.deepEqual(consoleIssues, [])
-  console.log('Browser fixture passed on all five screens at 1280x800 and 800x640, including ruleset selection while connected.')
+  console.log('Browser fixture passed on all five screens at 800x640, 1280x800, 1920x1000, and 2560x1375, including filter accounting, chart inspection, vertical traffic layouts, and wide-window fit.')
 
   const freshPage = await browser.newPage({
     viewport: { width: 1280, height: 800 },

@@ -3,6 +3,7 @@ import {
   useId,
   useRef,
   type ButtonHTMLAttributes,
+  type HTMLAttributes,
   type ReactNode,
 } from 'react'
 import { createPortal } from 'react-dom'
@@ -91,6 +92,65 @@ export function Progress({ value, label }: { value: number; label: string }) {
       <span style={{ width: `${clamped}%` }} />
     </div>
   )
+}
+
+export function Panel({
+  children,
+  className = '',
+  ...props
+}: { children: ReactNode; className?: string } & HTMLAttributes<HTMLElement>) {
+  return <section className={`panel ${className}`.trim()} {...props}>{children}</section>
+}
+
+export function PanelHeading({
+  title,
+  id,
+  kicker,
+  description,
+  actions,
+  className = '',
+}: {
+  title: ReactNode
+  id?: string
+  kicker?: string
+  description?: ReactNode
+  actions?: ReactNode
+  className?: string
+}) {
+  return (
+    <div className={`panel-heading ${className}`.trim()}>
+      <div className="panel-heading-copy">
+        {kicker ? <div className="panel-kicker">{kicker}</div> : null}
+        <h2 id={id}>{title}</h2>
+        {description ? <p className="panel-description">{description}</p> : null}
+      </div>
+      {actions ? <div className="panel-heading-actions">{actions}</div> : null}
+    </div>
+  )
+}
+
+export function Grid({ children, className = '' }: { children: ReactNode; className?: string }) {
+  return <div className={`ui-grid ${className}`.trim()}>{children}</div>
+}
+
+export function GridItem({
+  children,
+  span = 12,
+  className = '',
+}: {
+  children: ReactNode
+  span?: 3 | 4 | 5 | 6 | 7 | 8 | 9 | 12
+  className?: string
+}) {
+  return <div className={`ui-grid-item span-${span} ${className}`.trim()}>{children}</div>
+}
+
+export function Toolbar({
+  children,
+  className = '',
+  ...props
+}: { children: ReactNode; className?: string } & HTMLAttributes<HTMLDivElement>) {
+  return <div className={`toolbar ${className}`.trim()} {...props}>{children}</div>
 }
 
 export function EmptyState({
@@ -255,6 +315,19 @@ export function PageHeader({
   )
 }
 
-export function SourceBadge({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'green' | 'amber' | 'red' }) {
-  return <span className={`badge badge-${tone}`}>{children}</span>
+export function SourceBadge({
+  children,
+  tone = 'neutral',
+  dot = false,
+}: {
+  children: ReactNode
+  tone?: 'neutral' | 'accent' | 'violet' | 'amber' | 'red'
+  dot?: boolean
+}) {
+  return (
+    <span className={`badge badge-${tone}`}>
+      {dot ? <span className="badge-dot" aria-hidden="true" /> : null}
+      {children}
+    </span>
+  )
 }

@@ -33,6 +33,7 @@ export function Sidebar({
             type="button"
             className={`nav-item ${page === item.page ? 'is-active' : ''}`}
             aria-current={page === item.page ? 'page' : undefined}
+            aria-label={item.label}
             onClick={() => onNavigate(item.page)}
             title={item.label}
           >
@@ -49,7 +50,7 @@ export function Sidebar({
         <span className="sidebar-foot-text">
           {runtime.serviceAvailable ? 'TUN service ready' : runtime.serviceMessage ? 'TUN service unavailable' : 'TUN service check'}
         </span>
-        <span className="version">1.0.2</span>
+        <span className="version">1.0.3</span>
       </div>
     </aside>
   )

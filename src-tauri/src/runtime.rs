@@ -1232,11 +1232,13 @@ impl AppRuntime {
     pub fn history_report(&self, input: HistoryInput) -> Result<HistoryReport> {
         let groups = self.state.lock().custom_app_groups.clone();
         let history = self.history.lock();
-        history.report(
+        history.report_with_filters(
             &input.range,
             &input.breakdown,
             &groups,
             Utc::now().timestamp(),
+            input.route_filter,
+            input.subject_filter.as_ref(),
         )
     }
 

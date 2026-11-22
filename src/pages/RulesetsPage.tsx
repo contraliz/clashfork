@@ -12,9 +12,12 @@ import {
   Button,
   EmptyState,
   Field,
+  Grid,
+  GridItem,
   IconButton,
   Modal,
   PageHeader,
+  Panel,
   SourceBadge,
 } from '../components/ui'
 
@@ -183,8 +186,9 @@ export function RulesetsPage({ snapshot, onSnapshot, onError }: Props) {
         }
       />
 
-      <div className="rulesets-layout">
-        <aside className="panel ruleset-index" aria-label="Rulesets">
+      <Grid className="rulesets-layout">
+        <GridItem span={3}>
+        <Panel className="ruleset-index" aria-label="Rulesets">
           {state.rulesets.length === 0 ? (
             <p className="muted index-empty">No rulesets yet.</p>
           ) : (
@@ -198,15 +202,17 @@ export function RulesetsPage({ snapshot, onSnapshot, onError }: Props) {
                     onClick={() => selectRuleset(ruleset)}
                   >
                     <span>{ruleset.name}</span>
-                    {state.selection.rulesetId === ruleset.id ? <SourceBadge tone="green">Active</SourceBadge> : null}
+                    {state.selection.rulesetId === ruleset.id ? <SourceBadge tone="accent">Active</SourceBadge> : null}
                   </button>
                 </li>
               ))}
             </ul>
           )}
-        </aside>
+        </Panel>
+        </GridItem>
 
-        <section className="panel ruleset-detail">
+        <GridItem span={9}>
+        <Panel className="ruleset-detail">
           {!creatingNew && selected == null && !draft.name && draft.entries.length === 0 ? (
             <EmptyState
               title="Create a ruleset"
@@ -225,7 +231,7 @@ export function RulesetsPage({ snapshot, onSnapshot, onError }: Props) {
                     placeholder="Ruleset name"
                     onChange={(event) => setDraft({ ...draft, name: event.target.value })}
                   />
-                  {state.selection.rulesetId === draft.id ? <SourceBadge tone="green">Active</SourceBadge> : null}
+                  {state.selection.rulesetId === draft.id ? <SourceBadge tone="accent">Active</SourceBadge> : null}
                 </div>
                 <div className="ruleset-actions">
                   {draft.id ? (
@@ -385,8 +391,9 @@ export function RulesetsPage({ snapshot, onSnapshot, onError }: Props) {
               </div>
             </>
           )}
-        </section>
-      </div>
+        </Panel>
+        </GridItem>
+      </Grid>
 
       {groupEditor ? (
         <MatchGroupEditor

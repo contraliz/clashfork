@@ -418,7 +418,7 @@ export async function invoke(command: string, args?: Record<string, unknown>): P
       if (!args?.confirm) throw new Error('Confirmation is required to clear traffic history.')
       return delay(snapshot())
     case 'get_history':
-      return delay(history(args?.input as HistoryInput))
+      return delay(history(args?.input as HistoryInput, state.customAppGroups))
     case 'get_live':
       return live()
     case 'get_diagnostics':
@@ -445,57 +445,116 @@ export async function invoke(command: string, args?: Record<string, unknown>): P
   }
 }
 
-function history(input: HistoryInput): HistoryReport {
-  const days = input.range === 'today' ? 24 : input.range === '7d' ? 7 : 30
-  const labels = input.range === 'today'
-    ? Array.from({ length: 24 }, (_, index) => `${String(index).padStart(2, '0')}:00`)
-    : Array.from({ length: days }, (_, index) => {
-        const date = new Date()
-        date.setDate(date.getDate() - (days - 1 - index))
-        return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-      })
+function history(input: HistoryInput, groups: CustomAppGroup[]): HistoryReport {
+  const timestamp = now()
+  const currentDate = new Date(timestamp * 1000)
+  const today = new Date(currentDate)
+  today.setHours(0, 0, 0, 0)
+  const dayCount = input.range === '30d' ? 30 : input.range === '7d' ? 7 : 1
+  const firstDay = new Date(today)
+  firstDay.setDate(firstDay.getDate() - (dayCount - 1))
+  const periodCount = input.range === 'today' ? currentDate.getHours() + 1 : dayCount
   const scale = input.range === '30d' ? 0.42 : input.range === 'today' ? 0.08 : 1
-  const bars = labels.map((label, index) => {
+  const baseBars = Array.from({ length: periodCount }, (_, index) => {
+    const start = input.range === 'today'
+      ? Math.floor((today.getTime() / 1000 + index * 3600))
+      : Math.floor(firstDay.getTime() / 1000) + index * 86400
+    const date = new Date(start * 1000)
     const wave = 1.4 + Math.sin(index * 1.37) * 0.7 + (index % 5) * 0.2
     return {
-      start: now() - (labels.length - index) * 86400,
-      label,
+      start,
+      label: input.range === 'today'
+        ? date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+        : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
       download: Math.round(wave * 1.1 * 1024 ** 3 * scale),
       upload: Math.round(wave * 0.22 * 1024 ** 3 * scale),
       gap: input.range === '30d' && index === 17,
     }
   })
+  const shares = [
+    { app: 'ChatGPT.exe', route: 'Falemon / Singapore I0', routeClass: 'proxy' as const, download: 0.20, upload: 0.18 },
+    { app: 'ChatGPT.exe', route: 'Direct', routeClass: 'direct' as const, download: 0.10, upload: 0.08 },
+    { app: 'ChatGPT.exe', route: 'Blocked', routeClass: 'blocked' as const, download: 0.02, upload: 0.01 },
+    { app: 'ChatGPT.exe', route: 'Unknown chain', routeClass: 'unknown' as const, download: 0.01, upload: 0.01 },
+    { app: 'codex.exe', route: 'Falemon / Singapore I0', routeClass: 'proxy' as const, download: 0.19, upload: 0.21 },
+    { app: 'steam.exe', route: 'Direct', routeClass: 'direct' as const, download: 0.17, upload: 0.22 },
+    { app: 'firefox.exe', route: 'Unknown chain', routeClass: 'unknown' as const, download: 0.03, upload: 0.03 },
+  ]
+  const availableApps = [...new Map(shares.map((sample) => [sample.app.toLowerCase(), sample.app])).values()]
+    .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }))
+  const routeFilter = input.routeFilter ?? null
+  const subjectFilter = input.subjectFilter ?? null
+  const selectedGroup = subjectFilter?.kind === 'group'
+    ? groups.find((group) => group.id === subjectFilter.id)
+    : undefined
+  const isSelected = (sample: typeof shares[number]) => {
+    if (routeFilter && sample.routeClass !== routeFilter) return false
+    if (subjectFilter?.kind === 'app' && sample.app.toLowerCase() !== subjectFilter.name.toLowerCase()) return false
+    if (subjectFilter?.kind === 'group' && !selectedGroup?.apps.some((app) => app.toLowerCase() === sample.app.toLowerCase())) return false
+    return true
+  }
+  const filtered = routeFilter != null || subjectFilter != null
+  const rowsByKey = new Map<string, HistoryReport['rows'][number]>()
+  const bars = baseBars.map((bar) => {
+    const samples = shares.filter(isSelected).map((sample) => ({
+      ...sample,
+      download: Math.floor(bar.download * sample.download),
+      upload: Math.floor(bar.upload * sample.upload),
+    }))
+    const estimatedDownload = samples.reduce((sum, sample) => sum + sample.download, 0)
+    const estimatedUpload = samples.reduce((sum, sample) => sum + sample.upload, 0)
+    let periodDownload = 0
+    let periodUpload = 0
+    for (const sample of samples) {
+      const download = estimatedDownload > bar.download
+        ? Math.floor(sample.download * bar.download / estimatedDownload)
+        : sample.download
+      const upload = estimatedUpload > bar.upload
+        ? Math.floor(sample.upload * bar.upload / estimatedUpload)
+        : sample.upload
+      periodDownload += download
+      periodUpload += upload
+      const group = subjectFilter?.kind === 'group' && selectedGroup?.apps.some((app) => app.toLowerCase() === sample.app.toLowerCase())
+        ? selectedGroup
+        : groups.find((candidate) => candidate.apps.some((app) => app.toLowerCase() === sample.app.toLowerCase()))
+      const label = input.breakdown === 'route' ? sample.route : input.breakdown === 'customGroup' ? group?.name ?? sample.app : sample.app
+      const app = input.breakdown === 'app' || (input.breakdown === 'customGroup' && !group) ? sample.app : null
+      const route = input.breakdown === 'route' ? sample.route : null
+      const key = `${label}\u0000${sample.routeClass}`
+      const existing = rowsByKey.get(key) ?? { label, app, route, routeClass: sample.routeClass, download: 0, upload: 0, total: 0 }
+      existing.download += download
+      existing.upload += upload
+      existing.total = existing.download + existing.upload
+      rowsByKey.set(key, existing)
+    }
+    if (!filtered) {
+      const residualDownload = Math.max(0, bar.download - estimatedDownload)
+      const residualUpload = Math.max(0, bar.upload - estimatedUpload)
+      if (residualDownload > 0 || residualUpload > 0) {
+        const key = input.breakdown === 'route' ? 'Unattributed\u0000unknown' : 'Unattributed\u0000unknown'
+        const existing = rowsByKey.get(key) ?? {
+          label: 'Unattributed',
+          app: null,
+          route: input.breakdown === 'route' ? 'Unattributed' : null,
+          routeClass: 'unknown' as const,
+          download: 0,
+          upload: 0,
+          total: 0,
+        }
+        existing.download += residualDownload
+        existing.upload += residualUpload
+        existing.total = existing.download + existing.upload
+        rowsByKey.set(key, existing)
+      }
+    }
+    return { ...bar, download: filtered ? periodDownload : bar.download, upload: filtered ? periodUpload : bar.upload }
+  })
+  const rows = [...rowsByKey.values()].sort((left, right) => right.total - left.total || left.label.localeCompare(right.label))
   const totalDownload = bars.reduce((sum, bar) => sum + bar.download, 0)
   const totalUpload = bars.reduce((sum, bar) => sum + bar.upload, 0)
-  const rows: HistoryReport['rows'] = input.breakdown === 'route'
-    ? [
-        { label: 'Falemon / Singapore I0', app: null, route: 'Falemon / Singapore I0', routeClass: 'proxy', download: Math.round(totalDownload * 0.39), upload: Math.round(totalUpload * 0.36), total: 0 },
-        { label: 'Direct', app: null, route: 'Direct', routeClass: 'direct', download: Math.round(totalDownload * 0.27), upload: Math.round(totalUpload * 0.3), total: 0 },
-        { label: 'Blocked', app: null, route: 'Blocked', routeClass: 'blocked', download: Math.round(totalDownload * 0.03), upload: Math.round(totalUpload * 0.02), total: 0 },
-        { label: 'Unknown chain', app: null, route: 'Unknown chain', routeClass: 'unknown', download: Math.round(totalDownload * 0.04), upload: Math.round(totalUpload * 0.03), total: 0 },
-        { label: 'Unattributed', app: null, route: 'Unattributed', routeClass: 'unknown', download: Math.round(totalDownload * 0.27), upload: Math.round(totalUpload * 0.29), total: 0 },
-      ]
-    : input.breakdown === 'customGroup'
-      ? [
-          { label: 'AI tools', app: null, route: null, routeClass: 'proxy', download: Math.round(totalDownload * 0.28), upload: Math.round(totalUpload * 0.22), total: 0 },
-          { label: 'AI tools', app: null, route: null, routeClass: 'direct', download: Math.round(totalDownload * 0.12), upload: Math.round(totalUpload * 0.08), total: 0 },
-          { label: 'AI tools', app: null, route: null, routeClass: 'blocked', download: Math.round(totalDownload * 0.02), upload: Math.round(totalUpload * 0.01), total: 0 },
-          { label: 'Development', app: null, route: null, routeClass: 'proxy', download: Math.round(totalDownload * 0.23), upload: Math.round(totalUpload * 0.25), total: 0 },
-          { label: 'Steam', app: 'steam.exe', route: null, routeClass: 'direct', download: Math.round(totalDownload * 0.16), upload: Math.round(totalUpload * 0.19), total: 0 },
-          { label: 'Unattributed', app: null, route: null, routeClass: 'unknown', download: Math.round(totalDownload * 0.19), upload: Math.round(totalUpload * 0.25), total: 0 },
-        ]
-      : [
-          { label: 'ChatGPT.exe', app: 'ChatGPT.exe', route: null, routeClass: 'proxy', download: Math.round(totalDownload * 0.25), upload: Math.round(totalUpload * 0.2), total: 0 },
-          { label: 'ChatGPT.exe', app: 'ChatGPT.exe', route: null, routeClass: 'direct', download: Math.round(totalDownload * 0.1), upload: Math.round(totalUpload * 0.08), total: 0 },
-          { label: 'ChatGPT.exe', app: 'ChatGPT.exe', route: null, routeClass: 'blocked', download: Math.round(totalDownload * 0.02), upload: Math.round(totalUpload * 0.01), total: 0 },
-          { label: 'codex.exe', app: 'codex.exe', route: null, routeClass: 'proxy', download: Math.round(totalDownload * 0.23), upload: Math.round(totalUpload * 0.25), total: 0 },
-          { label: 'steam.exe', app: 'steam.exe', route: null, routeClass: 'direct', download: Math.round(totalDownload * 0.16), upload: Math.round(totalUpload * 0.19), total: 0 },
-          { label: 'Unattributed', app: null, route: null, routeClass: 'unknown', download: Math.round(totalDownload * 0.24), upload: Math.round(totalUpload * 0.27), total: 0 },
-        ]
-  for (const row of rows) row.total = row.download + row.upload
   return {
-    from: now() - days * 86400,
-    to: now(),
+    from: Math.floor(firstDay.getTime() / 1000),
+    to: timestamp,
     totalDownload,
     totalUpload,
     total: totalDownload + totalUpload,
@@ -503,6 +562,7 @@ function history(input: HistoryInput): HistoryReport {
     bars,
     rows,
     breakdown: input.breakdown,
+    availableApps,
   }
 }
 
@@ -585,11 +645,13 @@ function live(): LiveSnapshot {
 }
 
 function diagnostics() {
+  const at = now()
+  // The API is newest first; ids 4 and 5 also exercise the equal-second tie break.
   return [
-    { id: 1, at: now() - 6, source: 'app', level: 'info', message: 'Routing switched and existing flows were closed.' },
-    { id: 2, at: now() - 4, source: 'core', level: 'info', message: 'TUN: using adapter ClashforkTUN with mixed stack.' },
-    { id: 3, at: now() - 3, source: 'app', level: 'info', message: 'Subscription nodes refreshed.' },
-    { id: 4, at: now() - 2, source: 'service', level: 'info', message: 'Core running mode: Service; process discovery always enabled.' },
-    { id: 5, at: now() - 1, source: 'app', level: 'warn', message: 'Northwind refresh failed. Last known-good nodes retained; allowance marked stale.' },
+    { id: 5, at: at - 1, source: 'app', level: 'warn', message: 'Northwind refresh failed. Last known-good nodes retained; allowance marked stale.' },
+    { id: 4, at: at - 1, source: 'service', level: 'info', message: 'Core running mode: Service; process discovery always enabled.' },
+    { id: 3, at: at - 2, source: 'app', level: 'info', message: 'Subscription nodes refreshed.' },
+    { id: 2, at: at - 3, source: 'core', level: 'info', message: 'TUN: using adapter ClashforkTUN with mixed stack.' },
+    { id: 1, at: at - 4, source: 'app', level: 'info', message: 'Routing switched and existing flows were closed.' },
   ]
 }

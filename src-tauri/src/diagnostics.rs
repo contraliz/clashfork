@@ -27,6 +27,10 @@ impl Default for Diagnostics {
 
 impl Diagnostics {
     pub fn push(&self, source: &str, level: &str, message: impl AsRef<str>) {
+        self.push_at(Utc::now().timestamp(), source, level, message);
+    }
+
+    fn push_at(&self, at: i64, source: &str, level: &str, message: impl AsRef<str>) {
         let message = truncate(&redact(message.as_ref()), 2_000);
         if message.trim().is_empty() {
             return;
@@ -34,7 +38,7 @@ impl Diagnostics {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let entry = DiagnosticEntry {
             id,
-            at: Utc::now().timestamp(),
+            at,
             source: source.to_owned(),
             level: level.to_owned(),
             message,
@@ -46,8 +50,12 @@ impl Diagnostics {
         entries.push_back(entry);
     }
 
+    /// Newest first. IDs are assigned monotonically, so equal-second entries still have a
+    /// deterministic, stable order at the snapshot boundary.
     pub fn snapshot(&self) -> Vec<DiagnosticEntry> {
-        self.entries.lock().iter().cloned().collect()
+        let mut entries: Vec<_> = self.entries.lock().iter().cloned().collect();
+        entries.sort_by(|left, right| right.at.cmp(&left.at).then_with(|| right.id.cmp(&left.id)));
+        entries
     }
 }
 
@@ -118,8 +126,35 @@ mod tests {
         let entries = diagnostics.snapshot();
         assert_eq!(entries.len(), MAX_ENTRIES);
         assert_eq!(
-            entries.last().map(|entry| entry.message.as_str()),
+            entries.first().map(|entry| entry.message.as_str()),
             Some("message 419")
         );
+        assert_eq!(
+            entries.last().map(|entry| entry.message.as_str()),
+            Some("message 20")
+        );
+    }
+
+    #[test]
+    fn snapshot_is_newest_first_with_monotonic_tie_break() {
+        let diagnostics = Diagnostics::default();
+        diagnostics.push_at(100, "app", "info", "first at same second");
+        diagnostics.push_at(100, "core", "info", "second at same second");
+        diagnostics.push_at(101, "service", "warn", "newer second");
+
+        let entries = diagnostics.snapshot();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "newer second",
+                "second at same second",
+                "first at same second"
+            ]
+        );
+        assert_eq!(entries[1].at, entries[2].at);
+        assert!(entries[1].id > entries[2].id);
     }
 }

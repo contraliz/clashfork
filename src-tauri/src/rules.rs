@@ -13,6 +13,10 @@ pub const TUN_DEVICE: &str = "ClashforkTUN";
 pub const CORE_CONTROLLER_PORT: u16 = 19197;
 pub const DNS_PORT: u16 = 19198;
 
+/// Resolvers that do not depend on the tunnel or a system proxy. DIRECT traffic and proxy
+/// bootstrap both use this pool so a single unreachable DoH endpoint cannot stall DNS.
+const UNPROXIED_DOH: &[&str] = &["https://1.1.1.1/dns-query", "https://223.5.5.5/dns-query"];
+
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
     pub port: u16,
@@ -516,24 +520,31 @@ pub fn build_runtime_yaml(
         "default-nameserver",
         sequence_strings(&["223.5.5.5", "1.1.1.1"]),
     );
-    let nameservers = if selection.mode == Mode::Global {
-        [
-            "https://1.1.1.1/dns-query#GLOBAL",
-            "https://223.5.5.5/dns-query#GLOBAL",
-        ]
+    let nameservers: Vec<String> = if selection.mode == Mode::Global {
+        UNPROXIED_DOH
+            .iter()
+            .map(|server| format!("{server}#GLOBAL"))
+            .collect()
     } else {
-        ["https://1.1.1.1/dns-query", "https://223.5.5.5/dns-query"]
+        UNPROXIED_DOH
+            .iter()
+            .map(|server| (*server).to_owned())
+            .collect()
     };
-    map_insert(&mut dns, "nameserver", sequence_strings(&nameservers));
+    map_insert(
+        &mut dns,
+        "nameserver",
+        Value::Sequence(nameservers.into_iter().map(Value::String).collect()),
+    );
     map_insert(
         &mut dns,
         "proxy-server-nameserver",
-        sequence_strings(&["https://1.1.1.1/dns-query", "https://223.5.5.5/dns-query"]),
+        sequence_strings(UNPROXIED_DOH),
     );
     map_insert(
         &mut dns,
         "direct-nameserver",
-        sequence_strings(&["https://1.1.1.1/dns-query"]),
+        sequence_strings(UNPROXIED_DOH),
     );
     map_insert(
         &mut dns,
@@ -783,6 +794,183 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|v| v == "DIRECT")
+        );
+    }
+
+    #[test]
+    fn direct_dns_uses_the_shared_unproxied_resolver_pool() {
+        let (state, secrets, rule) = base();
+        let global = Selection {
+            mode: Mode::Global,
+            ruleset_id: None,
+            global_node_id: Some("node-2".into()),
+        };
+        let controller = ControllerConfig {
+            port: 19000,
+            secret: "fixture-secret".into(),
+            dns_port: 19198,
+        };
+        let expected_pool = vec![
+            Value::String("https://1.1.1.1/dns-query".into()),
+            Value::String("https://223.5.5.5/dns-query".into()),
+        ];
+
+        for (selection, global_mode) in [(rule, false), (global, true)] {
+            let compiled =
+                build_runtime_yaml(&state, &secrets, &selection, &controller, true).unwrap();
+            let value: Value = serde_yaml_ng::from_str(&compiled.yaml).unwrap();
+            let dns = &value["dns"];
+
+            assert_eq!(
+                dns["direct-nameserver"].as_sequence(),
+                Some(&expected_pool),
+                "DIRECT resolution must retain both unproxied DoH resolvers"
+            );
+            assert_eq!(
+                dns["proxy-server-nameserver"].as_sequence(),
+                Some(&expected_pool),
+                "proxy bootstrap must remain independent of general DNS routing"
+            );
+            let nameservers = dns["nameserver"].as_sequence().unwrap();
+            if global_mode {
+                assert_eq!(
+                    nameservers,
+                    &vec![
+                        Value::String("https://1.1.1.1/dns-query#GLOBAL".into()),
+                        Value::String("https://223.5.5.5/dns-query#GLOBAL".into()),
+                    ]
+                );
+            } else {
+                assert_eq!(nameservers, &expected_pool);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the bundled Mihomo executable"]
+    fn stock_mihomo_dns_fails_over_to_a_local_fixture() {
+        use std::{
+            net::UdpSocket,
+            process::{Child, Command, Stdio},
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            time::Duration,
+        };
+
+        struct RunningCore(Child);
+        impl Drop for RunningCore {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn query(id: u16, name: &str) -> Vec<u8> {
+            let mut packet = Vec::with_capacity(64);
+            packet.extend_from_slice(&id.to_be_bytes());
+            packet.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            for label in name.split('.') {
+                packet.push(label.len() as u8);
+                packet.extend_from_slice(label.as_bytes());
+            }
+            packet.push(0);
+            packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            packet
+        }
+
+        let fixture = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        fixture
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let fixture_port = fixture.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let mut request = [0u8; 512];
+            while !stop_server.load(Ordering::Relaxed) {
+                let Ok((length, from)) = fixture.recv_from(&mut request) else {
+                    continue;
+                };
+                let question_end = {
+                    let mut index = 12;
+                    while index < length && request[index] != 0 {
+                        index += request[index] as usize + 1;
+                    }
+                    index + 5
+                };
+                if length < 16 || request[question_end - 4..question_end - 2] != [0, 1] {
+                    continue;
+                }
+                let mut response = Vec::with_capacity(64);
+                response.extend_from_slice(&request[0..2]);
+                response.extend_from_slice(&[
+                    0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+                ]);
+                response.extend_from_slice(&request[12..question_end]);
+                response.extend_from_slice(&[
+                    0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 203, 0,
+                    113, 7,
+                ]);
+                let _ = fixture.send_to(&response, from);
+            }
+        });
+
+        let dead = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let listener = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let dns_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = format!(
+            "mixed-port: 0\nmode: direct\nipv6: false\ndns:\n  enable: true\n  listen: 127.0.0.1:{dns_port}\n  ipv6: false\n  enhanced-mode: normal\n  nameserver:\n    - 127.0.0.1:{dead_port}\n    - 127.0.0.1:{fixture_port}\nrules:\n  - MATCH,DIRECT\n"
+        );
+        let core =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/clashfork-core.exe");
+        let scratch = tempfile::tempdir().unwrap();
+        let config_path = scratch.path().join("dns-fixture.yaml");
+        std::fs::write(&config_path, config).unwrap();
+        let _child = RunningCore(
+            Command::new(core)
+                .arg("-d")
+                .arg(scratch.path())
+                .arg("-f")
+                .arg(&config_path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+
+        let client = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut resolved = false;
+        for attempt in 0..30 {
+            let _ = client.send_to(
+                &query(0x1234 + attempt, "fixture.test"),
+                ("127.0.0.1", dns_port),
+            );
+            let mut response = [0u8; 512];
+            if let Ok((length, _)) = client.recv_from(&mut response) {
+                if response[..length]
+                    .windows(4)
+                    .any(|address| address == [203, 0, 113, 7])
+                {
+                    resolved = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        assert!(
+            resolved,
+            "the stock core did not fall back to the live local DNS fixture"
         );
     }
 

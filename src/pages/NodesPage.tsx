@@ -10,8 +10,10 @@ import {
   IconButton,
   Modal,
   PageHeader,
+  Panel,
   Progress,
   SourceBadge,
+  Toolbar,
 } from '../components/ui'
 
 interface Props {
@@ -98,9 +100,9 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
         }
       />
 
-      <div className="search-row">
+      <Toolbar className="search-row">
         <label className="search-field">
-          <Icon name="search" size={21} />
+          <Icon name="search" size={18} />
           <span className="sr-only">Search nodes</span>
           <input
             value={search}
@@ -108,10 +110,11 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
             onChange={(event) => setSearch(event.target.value)}
           />
         </label>
-      </div>
+        <span className="toolbar-meta">{filtered.length} {filtered.length === 1 ? 'node' : 'nodes'}</span>
+      </Toolbar>
 
       {state.services.length === 0 ? (
-        <div className="panel">
+        <Panel>
           <EmptyState
             title="No nodes yet"
             description="Add an HTTPS Clash/Mihomo subscription or an individual share link. Only node definitions and provider metadata are imported."
@@ -121,7 +124,7 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
               </Button>
             }
           />
-        </div>
+        </Panel>
       ) : (
         <div className="service-stack">
           {state.services.map((service) => {
@@ -129,7 +132,7 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
             const isCollapsed = collapsed[service.id]
             const progress = allowanceProgress(service.allowance)
             return (
-              <section className="panel service-card" key={service.id}>
+              <Panel className="service-card" key={service.id}>
                 <div className="service-head">
                   <button
                     type="button"
@@ -208,7 +211,7 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
                                 {node.missing ? (
                                   <SourceBadge tone="red">Missing · choose replacement</SourceBadge>
                                 ) : (
-                                  <span className="available-label"><span className="status-dot" />Available</span>
+                                  <SourceBadge tone="accent" dot>Available</SourceBadge>
                                 )}
                               </td>
                             </tr>
@@ -218,7 +221,7 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
                     )}
                   </div>
                 ) : null}
-              </section>
+              </Panel>
             )
           })}
         </div>

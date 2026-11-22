@@ -1,15 +1,28 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import { formatBytes, formatTime, prettyDateRange } from '../lib/format'
-import type { CustomAppGroup, DiagnosticEntry, HistoryReport, Snapshot } from '../types'
+import { sortDiagnosticsNewestFirst } from '../lib/diagnostics'
+import type {
+  CustomAppGroup,
+  DiagnosticEntry,
+  HistoryBar,
+  HistoryReport,
+  HistorySubjectFilter,
+  Snapshot,
+} from '../types'
 import { Icon } from '../components/Icon'
 import {
   Button,
   EmptyState,
   Field,
+  Grid,
+  GridItem,
   IconButton,
   Modal,
   PageHeader,
+  Panel,
+  PanelHeading,
+  Toolbar,
 } from '../components/ui'
 
 interface Props {
@@ -20,32 +33,96 @@ interface Props {
 
 type Range = 'today' | '7d' | '30d'
 type Breakdown = 'app' | 'customGroup' | 'route'
+type RouteFilter = 'all' | 'proxy' | 'direct'
+
+function historySubjectValue(filter: HistorySubjectFilter | null): string {
+  return filter ? JSON.stringify(filter) : 'all'
+}
+
+function historySubjectFromValue(value: string): HistorySubjectFilter | null {
+  if (value === 'all') return null
+  try {
+    const parsed = JSON.parse(value) as Partial<HistorySubjectFilter>
+    if (parsed.kind === 'app' && typeof parsed.name === 'string') {
+      return { kind: 'app', name: parsed.name }
+    }
+    if (parsed.kind === 'group' && typeof parsed.id === 'string') {
+      return { kind: 'group', id: parsed.id }
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function historyPeriodLabel(bar: HistoryBar, range: Range): string {
+  const date = new Date(bar.start * 1000)
+  const options: Intl.DateTimeFormatOptions = range === 'today'
+    ? { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }
+    : { year: 'numeric', month: 'short', day: 'numeric' }
+  return new Intl.DateTimeFormat(undefined, options).format(date)
+}
 
 export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
   const [tab, setTab] = useState<'history' | 'diagnostics'>('history')
   const [range, setRange] = useState<Range>('7d')
   const [breakdown, setBreakdown] = useState<Breakdown>('app')
+  const [routeFilter, setRouteFilter] = useState<RouteFilter>('all')
+  const [subjectFilter, setSubjectFilter] = useState<HistorySubjectFilter | null>(null)
+  const [historyRevision, setHistoryRevision] = useState(0)
   const [report, setReport] = useState<HistoryReport | null>(null)
+  const [availableApps, setAvailableApps] = useState<string[]>([])
+  const [inspectedPeriod, setInspectedPeriod] = useState<HistoryBar | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [clearOpen, setClearOpen] = useState(false)
   const [groupOpen, setGroupOpen] = useState(false)
   const [diagnostics, setDiagnostics] = useState<DiagnosticEntry[]>([])
 
-  const loadReport = async () => {
-    setBusy('history')
-    try {
-      setReport(await api.getHistory({ range, breakdown }))
-    } catch (error) {
-      onError(error)
-    } finally {
-      setBusy(null)
-    }
-  }
-
   useEffect(() => {
-    void loadReport()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [range, breakdown, snapshot.runtime.vpnActive, snapshot.state.historyPaused])
+    let cancelled = false
+    setReport(null)
+    setInspectedPeriod(null)
+    setBusy('history')
+    void api.getHistory({
+      range,
+      breakdown,
+      routeFilter: routeFilter === 'all' ? null : routeFilter,
+      subjectFilter,
+    }).then((nextReport) => {
+      if (cancelled) return
+      setReport(nextReport)
+      setAvailableApps(nextReport.availableApps)
+      if (
+        subjectFilter?.kind === 'app' &&
+        !nextReport.availableApps.some((app) => app.localeCompare(subjectFilter.name, undefined, { sensitivity: 'accent' }) === 0)
+      ) {
+        setSubjectFilter(null)
+      }
+      if (
+        subjectFilter?.kind === 'group' &&
+        !snapshot.state.customAppGroups.some((group) => group.id === subjectFilter.id && group.apps.length > 0)
+      ) {
+        setSubjectFilter(null)
+      }
+    }).catch((error: unknown) => {
+      if (!cancelled) onError(error)
+    }).finally(() => {
+      if (!cancelled) setBusy((current) => current === 'history' ? null : current)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    breakdown,
+    onError,
+    range,
+    routeFilter,
+    historyRevision,
+    snapshot.runtime.vpnActive,
+    snapshot.state.customAppGroups,
+    snapshot.state.historyPaused,
+    subjectFilter,
+  ])
 
   useEffect(() => {
     if (tab !== 'diagnostics') return
@@ -70,6 +147,15 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
     () => Math.max(1, ...(report?.bars.flatMap((bar) => [bar.download, bar.upload]) ?? [1])),
     [report],
   )
+  const eligibleGroups = useMemo(
+    () => snapshot.state.customAppGroups.filter((group) => group.apps.length > 0),
+    [snapshot.state.customAppGroups],
+  )
+  const hasHistoryFilters = routeFilter !== 'all' || subjectFilter !== null
+  const orderedDiagnostics = useMemo(
+    () => sortDiagnosticsNewestFirst(diagnostics),
+    [diagnostics],
+  )
 
   return (
     <div>
@@ -86,78 +172,193 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
 
       {tab === 'history' ? (
         <div className="history-view">
-          <div className="history-controls">
-            <div className="range-tabs" role="group" aria-label="History range">
-              {(['today', '7d', '30d'] as const).map((option) => (
-                <button key={option} type="button" className={range === option ? 'is-selected' : ''} aria-pressed={range === option} onClick={() => setRange(option)}>
-                  {option === 'today' ? 'Today' : option === '7d' ? '7 days' : '30 days'}
-                </button>
-              ))}
-            </div>
-            <div className="history-actions">
-              <Button
-                variant="secondary"
-                icon={snapshot.state.historyPaused ? 'play' : 'pause'}
-                busy={busy === 'pause'}
-                onClick={async () => {
-                  setBusy('pause')
-                  try {
-                    onSnapshot(await api.setHistoryPaused(!snapshot.state.historyPaused))
-                  } catch (error) {
-                    onError(error)
-                  } finally {
-                    setBusy(null)
-                  }
-                }}
-              >
-                {snapshot.state.historyPaused ? 'Resume' : 'Pause'}
-              </Button>
-              <Button variant="secondary" icon="trash" onClick={() => setClearOpen(true)}>Clear history</Button>
-            </div>
-          </div>
+          <Panel className="history-toolbar-panel">
+            <Toolbar className="history-controls" role="group" aria-label="Traffic history controls">
+              <div className="range-tabs" role="group" aria-label="History range">
+                {(['today', '7d', '30d'] as const).map((option) => (
+                  <button key={option} type="button" className={range === option ? 'is-selected' : ''} aria-pressed={range === option} onClick={() => setRange(option)}>
+                    {option === 'today' ? 'Today' : option === '7d' ? '7 days' : '30 days'}
+                  </button>
+                ))}
+              </div>
+              <div className="history-actions">
+                <Button
+                  variant="secondary"
+                  icon={snapshot.state.historyPaused ? 'play' : 'pause'}
+                  busy={busy === 'pause'}
+                  onClick={async () => {
+                    setBusy('pause')
+                    try {
+                      onSnapshot(await api.setHistoryPaused(!snapshot.state.historyPaused))
+                    } catch (error) {
+                      onError(error)
+                    } finally {
+                      setBusy(null)
+                    }
+                  }}
+                >
+                  {snapshot.state.historyPaused ? 'Resume' : 'Pause'}
+                </Button>
+                <Button variant="secondary" icon="trash" onClick={() => setClearOpen(true)}>Clear history</Button>
+              </div>
+              <Field label="Route" className="history-filter-route">
+                <select
+                  aria-label="Route"
+                  value={routeFilter}
+                  onChange={(event) => setRouteFilter(event.target.value as RouteFilter)}
+                >
+                  <option value="all">All routes</option>
+                  <option value="proxy">Proxy</option>
+                  <option value="direct">Direct</option>
+                </select>
+              </Field>
+              <Field label="App or group" className="history-filter-subject">
+                <select
+                  aria-label="App or group"
+                  value={historySubjectValue(subjectFilter)}
+                  onChange={(event) => setSubjectFilter(historySubjectFromValue(event.target.value))}
+                >
+                  <option value="all">All apps and groups</option>
+                  {eligibleGroups.length > 0 ? (
+                    <optgroup label="Custom app groups">
+                      {eligibleGroups.map((group) => (
+                        <option value={historySubjectValue({ kind: 'group', id: group.id })} key={group.id}>
+                          {group.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : null}
+                  {availableApps.length > 0 ? (
+                    <optgroup label="Apps in this range">
+                      {availableApps.map((app) => (
+                        <option value={historySubjectValue({ kind: 'app', name: app })} key={app}>
+                          {app}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : (
+                    <option value="" disabled>No attributed apps in this range</option>
+                  )}
+                </select>
+              </Field>
+              {hasHistoryFilters ? (
+                <Button
+                  variant="secondary"
+                  icon="refresh"
+                  className="history-filter-reset"
+                  onClick={() => {
+                    setRouteFilter('all')
+                    setSubjectFilter(null)
+                  }}
+                >
+                  Reset filters
+                </Button>
+              ) : null}
+            </Toolbar>
+          </Panel>
 
           {snapshot.state.historyPaused ? <div className="paused-note">History recording is paused. Existing data remains available.</div> : null}
 
-          <div className="history-total">
-            <strong>{report ? formatBytes(report.total) : '—'}</strong>
-            <span>Total transferred</span>
-            {report ? <span className="muted">{prettyDateRange(report.from, report.to)}</span> : null}
-          </div>
-
-          <section className="panel chart-panel" aria-labelledby="traffic-history-heading">
-            <div className="chart-panel-head">
-              <h2 id="traffic-history-heading" className="sr-only">Traffic history chart</h2>
-              <div className="chart-legend">
-                <span><i className="legend-download" /> Download</span>
-                <span><i className="legend-upload" /> Upload</span>
-              </div>
-            </div>
-            {report ? (
-              <div className="bar-chart-wrap">
-                <div className="bar-y-axis" aria-hidden="true">
-                  {[1, 0.75, 0.5, 0.25, 0].map((fraction) => <span key={fraction}>{formatBytes(max * fraction)}</span>)}
+          <Grid className="history-grid">
+            <GridItem span={12}>
+              <Panel
+                className="metric-panel"
+                data-history-total-download={report?.totalDownload ?? 0}
+                data-history-total-upload={report?.totalUpload ?? 0}
+                data-history-total={report?.total ?? 0}
+              >
+                <div className="history-summary-main">
+                  <span className="metric-label">Total transferred</span>
+                  <strong className="metric-value">{report ? formatBytes(report.total) : '—'}</strong>
+                  {report ? <span className="muted metric-range">{prettyDateRange(report.from, report.to)}</span> : null}
                 </div>
-                <div className="bar-chart-scroll">
-                  <div className="bar-chart" style={{ minWidth: `${Math.max(520, report.bars.length * (range === '30d' ? 26 : 58))}px` }}>
-                    {report.bars.map((bar) => (
-                      <div className="bar-group" key={bar.start} title={`${bar.label}: ↓${formatBytes(bar.download)} ↑${formatBytes(bar.upload)}`}>
-                        <div className="bar-stack">
-                          <span className="bar bar-download" style={{ height: `${(bar.download / max) * 100}%` }} />
-                          <span className="bar bar-upload" style={{ height: `${(bar.upload / max) * 100}%` }} />
-                        </div>
-                        <span className={`bar-label ${bar.gap ? 'has-gap' : ''}`}>{bar.label}{bar.gap ? ' ·' : ''}</span>
-                      </div>
-                    ))}
+                <div className="history-subtotals" aria-label="Download and upload subtotals">
+                  <div>
+                    <span><i className="legend-download" /> Download</span>
+                    <strong>{report ? formatBytes(report.totalDownload) : '—'}</strong>
+                  </div>
+                  <div>
+                    <span><i className="legend-upload" /> Upload</span>
+                    <strong>{report ? formatBytes(report.totalUpload) : '—'}</strong>
                   </div>
                 </div>
-              </div>
-            ) : (
-              <div className="chart-loading" aria-live="polite">Loading traffic history…</div>
-            )}
-            {report && report.gapMinutes > 0 ? <p className="gap-note"><Icon name="alert" size={15} /> {report.gapMinutes} minute{report.gapMinutes === 1 ? '' : 's'} with a data gap</p> : null}
-          </section>
+              </Panel>
+            </GridItem>
+            <GridItem span={12}>
+              <Panel className="chart-panel" aria-labelledby="traffic-history-heading">
+                <PanelHeading
+                  id="traffic-history-heading"
+                  title="Traffic history"
+                  actions={
+                    <div className="chart-legend">
+                      <span><i className="legend-download" /> Download</span>
+                      <span><i className="legend-upload" /> Upload</span>
+                    </div>
+                  }
+                />
+                {report ? (
+                  <>
+                    <div className="bar-period-inspector" role="status" aria-live="polite">
+                      {inspectedPeriod ? (
+                        <>
+                          <strong>{historyPeriodLabel(inspectedPeriod, range)}</strong>
+                          <span><i className="legend-download" /> Download {formatBytes(inspectedPeriod.download)}</span>
+                          <span><i className="legend-upload" /> Upload {formatBytes(inspectedPeriod.upload)}</span>
+                          <span className={inspectedPeriod.gap ? 'has-recording-gap' : ''}>
+                            {inspectedPeriod.gap ? 'Recording gap' : 'No recording gap'}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="muted">Hover over or focus a period to inspect it.</span>
+                      )}
+                    </div>
+                    <div className="bar-chart-wrap">
+                      <div className="bar-y-axis" aria-hidden="true">
+                        {[1, 0.75, 0.5, 0.25, 0].map((fraction) => <span key={fraction}>{formatBytes(max * fraction)}</span>)}
+                      </div>
+                      <div className="bar-chart-scroll" onMouseLeave={() => setInspectedPeriod(null)}>
+                        <div className="bar-chart" style={{ minWidth: `${Math.max(430, report.bars.length * (range === '30d' ? 24 : 52))}px` }}>
+                          {report.bars.map((bar) => {
+                            const periodLabel = historyPeriodLabel(bar, range)
+                            const description = `${periodLabel}. Download ${formatBytes(bar.download)}. Upload ${formatBytes(bar.upload)}. ${bar.gap ? 'Recording gap in this period.' : 'No recording gap recorded for this period.'}`
+                            return (
+                              <button
+                                type="button"
+                                className="bar-group"
+                                key={bar.start}
+                                title={description}
+                                aria-label={description}
+                                data-history-bar-download={bar.download}
+                                data-history-bar-upload={bar.upload}
+                                data-history-bar-gap={bar.gap ? 'true' : 'false'}
+                                onMouseEnter={() => setInspectedPeriod(bar)}
+                                onFocus={() => setInspectedPeriod(bar)}
+                                onBlur={() => setInspectedPeriod((current) => current?.start === bar.start ? null : current)}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Escape') setInspectedPeriod(null)
+                                }}
+                              >
+                                <span className="bar-stack" aria-hidden="true">
+                                  <span className="bar bar-download" style={{ height: `${(bar.download / max) * 100}%` }} />
+                                  <span className="bar bar-upload" style={{ height: `${(bar.upload / max) * 100}%` }} />
+                                </span>
+                                <span className={`bar-label ${bar.gap ? 'has-gap' : ''}`} aria-hidden="true">{bar.label}{bar.gap ? ' ·' : ''}</span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="chart-loading" aria-live="polite">Loading traffic history…</div>
+                )}
+                {report && report.gapMinutes > 0 ? <p className="gap-note"><Icon name="alert" size={14} /> {report.gapMinutes} minute{report.gapMinutes === 1 ? '' : 's'} with a data gap</p> : null}
+              </Panel>
+            </GridItem>
+          </Grid>
 
-          <div className="breakdown-row">
+          <Toolbar className="breakdown-row">
             <label>
               <span className="sr-only">Breakdown</span>
               <select value={breakdown} onChange={(event) => setBreakdown(event.target.value as Breakdown)}>
@@ -167,60 +368,94 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
               </select>
             </label>
             <Button variant="secondary" icon="edit" onClick={() => setGroupOpen(true)}>Manage app groups</Button>
-          </div>
+          </Toolbar>
 
-          <section className="panel history-table-panel">
-            {report ? (
-              <table className="history-table">
-                <thead>
-                  <tr>
-                    <th scope="col">{breakdown === 'route' ? 'Route' : breakdown === 'customGroup' ? 'Group' : 'App'}</th>
-                    <th scope="col" className="numeric">Download</th>
-                    <th scope="col" className="numeric">Upload</th>
-                    <th scope="col" className="numeric">Transferred</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {report.rows.map((row) => (
-                    <tr key={`${row.label}-${row.app ?? ''}-${row.route ?? ''}-${row.routeClass}`}>
-                      <td>
-                        <strong>{row.label}</strong>
-                        {row.app && row.app !== row.label ? <span className="sub-label">{row.app}</span> : null}
-                        <span className={`route-class route-class-${row.routeClass}`}>{row.routeClass[0].toUpperCase() + row.routeClass.slice(1)}</span>
-                      </td>
-                      <td className="numeric">{formatBytes(row.download)}</td>
-                      <td className="numeric">{formatBytes(row.upload)}</td>
-                      <td className="numeric"><strong>{formatBytes(row.total)}</strong></td>
+          <Panel
+            className="history-table-panel"
+            data-history-total-download={report?.totalDownload ?? 0}
+            data-history-total-upload={report?.totalUpload ?? 0}
+          >
+            {report && report.rows.length > 0 ? (
+              <div className="table-wrap">
+                <table className="history-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">{breakdown === 'route' ? 'Route' : breakdown === 'customGroup' ? 'Group' : 'App'}</th>
+                      <th scope="col" className="numeric">Download</th>
+                      <th scope="col" className="numeric">Upload</th>
+                      <th scope="col" className="numeric">Transferred</th>
                     </tr>
-                  ))}
-                  {report.rows.length === 0 ? <tr><td colSpan={4} className="table-empty">No traffic has been recorded in this range.</td></tr> : null}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {report.rows.map((row) => (
+                      <tr
+                        key={`${row.label}-${row.app ?? ''}-${row.route ?? ''}-${row.routeClass}`}
+                        data-history-row-download={row.download}
+                        data-history-row-upload={row.upload}
+                      >
+                        <td>
+                          <strong>{row.label}</strong>
+                          {row.app && row.app !== row.label ? <span className="sub-label">{row.app}</span> : null}
+                          <span className={`route-class route-class-${row.routeClass}`}>{row.routeClass[0].toUpperCase() + row.routeClass.slice(1)}</span>
+                        </td>
+                        <td className="numeric">{formatBytes(row.download)}</td>
+                        <td className="numeric">{formatBytes(row.upload)}</td>
+                        <td className="numeric"><strong>{formatBytes(row.total)}</strong></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : report ? (
+              <EmptyState
+                title={hasHistoryFilters ? 'No traffic matches these filters' : 'No traffic has been recorded in this range'}
+                description={hasHistoryFilters
+                  ? 'Try another route, app, or custom group. You can reset both filters to see all recorded traffic.'
+                  : 'Traffic history will appear here after attributed or total traffic is recorded.'}
+                action={hasHistoryFilters ? (
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      setRouteFilter('all')
+                      setSubjectFilter(null)
+                    }}
+                  >
+                    Reset filters
+                  </Button>
+                ) : undefined}
+              />
             ) : (
-              <EmptyState title="No report yet" description="Traffic history loads from the local SQLite database." />
+              <EmptyState
+                title={busy === 'history' ? 'Updating traffic history' : 'No report yet'}
+                description="Traffic history loads from the local SQLite database."
+              />
             )}
-          </section>
+          </Panel>
         </div>
       ) : (
-        <section className="panel diagnostics-panel">
-          <div className="diagnostics-head">
-            <div>
-              <h2>Live diagnostics</h2>
-              <p>Bounded application and core messages. Credentials, URLs, and query tokens are redacted.</p>
-            </div>
-            <Button variant="secondary" icon="refresh" onClick={() => void api.getDiagnostics().then(setDiagnostics).catch(onError)}>Refresh</Button>
-          </div>
+        <Panel className="diagnostics-panel">
+          <PanelHeading
+            title="Live diagnostics"
+            description="Bounded application and core messages, newest first. Credentials, URLs, and query tokens are redacted."
+            actions={<Button variant="secondary" icon="refresh" onClick={() => void api.getDiagnostics().then(setDiagnostics).catch(onError)}>Refresh</Button>}
+            className="diagnostics-head"
+          />
           <div className="diagnostics-log" role="log" aria-live="polite">
-            {diagnostics.length === 0 ? <p className="muted">No diagnostics yet.</p> : null}
-            {diagnostics.map((entry) => (
-              <div className={`diagnostic-line level-${entry.level}`} key={entry.id}>
+            {orderedDiagnostics.length === 0 ? <p className="muted diagnostic-empty">No diagnostics yet.</p> : null}
+            {orderedDiagnostics.map((entry) => (
+              <div
+                className={`diagnostic-line level-${entry.level}`}
+                key={entry.id}
+                data-diagnostic-id={entry.id}
+                data-diagnostic-at={entry.at}
+              >
                 <span className="diag-time">{formatTime(entry.at)}</span>
                 <span className={`diag-source source-${entry.source}`}>{entry.source}</span>
                 <span className="diag-message">{entry.message}</span>
               </div>
             ))}
           </div>
-        </section>
+        </Panel>
       )}
 
       {clearOpen ? (
@@ -239,7 +474,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                   try {
                     onSnapshot(await api.clearHistory(true))
                     setClearOpen(false)
-                    await loadReport()
+                    setHistoryRevision((revision) => revision + 1)
                   } catch (error) {
                     onError(error)
                   } finally {
@@ -263,7 +498,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
           onError={onError}
           onSaved={async (next) => {
             onSnapshot(next)
-            await loadReport()
+            setHistoryRevision((revision) => revision + 1)
           }}
         />
       ) : null}

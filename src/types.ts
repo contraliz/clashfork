@@ -190,6 +190,7 @@ export interface HistoryReport {
   bars: HistoryBar[]
   rows: HistoryRow[]
   breakdown: 'app' | 'customGroup' | 'route'
+  availableApps: string[]
 }
 
 export interface DiagnosticEntry {
@@ -221,4 +222,10 @@ export interface SaveMatchGroupInput {
 export interface HistoryInput {
   range: 'today' | '7d' | '30d'
   breakdown: 'app' | 'customGroup' | 'route'
+  routeFilter?: 'proxy' | 'direct' | null
+  subjectFilter?: HistorySubjectFilter | null
 }
+
+export type HistorySubjectFilter =
+  | { kind: 'group'; id: string }
+  | { kind: 'app'; name: string }

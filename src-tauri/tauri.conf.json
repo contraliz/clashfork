@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Clashfork",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "identifier": "io.clashfork.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -22,7 +22,7 @@
         "resizable": true,
         "center": true,
         "visible": true,
-        "backgroundColor": "#f7f8f5"
+        "backgroundColor": "#101318"
       }
     ],
     "security": {

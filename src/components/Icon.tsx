@@ -157,13 +157,13 @@ export function Icon({
 export function Logo({ size = 34 }: { size?: number }) {
   return (
     <svg viewBox="0 0 1024 1024" width={size} height={size} aria-hidden="true">
-      <path d="M512 108 800 218v258c0 196-108 336-288 434-180-98-288-238-288-434V218l288-110Z" fill="#195d47" />
-      <path d="M512 176 736 262v214c0 155-82 270-224 356-142-86-224-201-224-356V262l224-86Z" fill="#f7f8f5" />
-      <circle cx="512" cy="422" r="68" fill="#195d47" />
-      <circle cx="424" cy="566" r="50" fill="#195d47" />
-      <circle cx="600" cy="566" r="50" fill="#195d47" />
-      <circle cx="512" cy="660" r="42" fill="#195d47" />
-      <path d="M512 422 424 566M512 422l88 144M424 566l88 94M600 566l-88 94" stroke="#195d47" strokeWidth="26" strokeLinecap="round" />
+      <path d="M512 108 800 218v258c0 196-108 336-288 434-180-98-288-238-288-434V218l288-110Z" fill="#78a9ff" />
+      <path d="M512 176 736 262v214c0 155-82 270-224 356-142-86-224-201-224-356V262l224-86Z" fill="#101318" />
+      <circle cx="512" cy="422" r="68" fill="#78a9ff" />
+      <circle cx="424" cy="566" r="50" fill="#78a9ff" />
+      <circle cx="600" cy="566" r="50" fill="#78a9ff" />
+      <circle cx="512" cy="660" r="42" fill="#b99bff" />
+      <path d="M512 422 424 566M512 422l88 144M424 566l88 94M600 566l-88 94" stroke="#78a9ff" strokeWidth="26" strokeLinecap="round" />
     </svg>
   )
 }

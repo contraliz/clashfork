@@ -390,6 +390,7 @@ pub struct HistoryReport {
     pub bars: Vec<HistoryBar>,
     pub rows: Vec<HistoryRow>,
     pub breakdown: String,
+    pub available_apps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,4 +440,22 @@ pub struct ConditionDraft {
 pub struct HistoryInput {
     pub range: String,
     pub breakdown: String,
+    #[serde(default)]
+    pub route_filter: Option<HistoryRouteFilter>,
+    #[serde(default)]
+    pub subject_filter: Option<HistorySubjectFilter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryRouteFilter {
+    Proxy,
+    Direct,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum HistorySubjectFilter {
+    Group { id: String },
+    App { name: String },
 }

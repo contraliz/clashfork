@@ -1,4 +1,7 @@
-use crate::models::{CustomAppGroup, HistoryBar, HistoryReport, HistoryRow, RouteClass};
+use crate::models::{
+    CustomAppGroup, HistoryBar, HistoryReport, HistoryRouteFilter, HistoryRow,
+    HistorySubjectFilter, RouteClass,
+};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Local, TimeZone, Timelike};
 use rusqlite::{Connection, params};
@@ -7,6 +10,14 @@ use std::path::Path;
 
 pub struct HistoryStore {
     conn: Connection,
+}
+
+struct FilteredSample {
+    app: String,
+    route: String,
+    route_class: RouteClass,
+    download: u64,
+    upload: u64,
 }
 
 impl HistoryStore {
@@ -118,10 +129,38 @@ impl HistoryStore {
         groups: &[CustomAppGroup],
         now: i64,
     ) -> Result<HistoryReport> {
+        self.report_with_filters(range, breakdown, groups, now, None, None)
+    }
+
+    pub fn report_with_filters(
+        &self,
+        range: &str,
+        breakdown: &str,
+        groups: &[CustomAppGroup],
+        now: i64,
+        route_filter: Option<HistoryRouteFilter>,
+        subject_filter: Option<&HistorySubjectFilter>,
+    ) -> Result<HistoryReport> {
         let (from, bar_mode) = range_bounds(range, now)?;
-        let (total_download, total_upload, gap_minutes, bars) =
-            self.totals_and_bars(from, now, bar_mode)?;
-        let rows = self.build_rows(from, now, breakdown, groups, total_download, total_upload)?;
+        let available_apps = self.available_apps(from, now)?;
+        let (total_download, total_upload, gap_minutes, bars, rows) =
+            if route_filter.is_none() && subject_filter.is_none() {
+                let (total_download, total_upload, gap_minutes, bars) =
+                    self.totals_and_bars(from, now, bar_mode)?;
+                let rows =
+                    self.build_rows(from, now, breakdown, groups, total_download, total_upload)?;
+                (total_download, total_upload, gap_minutes, bars, rows)
+            } else {
+                self.filtered_report_parts(
+                    from,
+                    now,
+                    bar_mode,
+                    breakdown,
+                    groups,
+                    route_filter,
+                    subject_filter,
+                )?
+            };
         Ok(HistoryReport {
             from,
             to: now,
@@ -132,6 +171,7 @@ impl HistoryStore {
             bars,
             rows,
             breakdown: breakdown.to_owned(),
+            available_apps,
         })
     }
 
@@ -185,6 +225,201 @@ impl HistoryStore {
             })
             .collect();
         Ok((totals_down, totals_up, gaps, bars))
+    }
+
+    fn available_apps(&self, from: i64, to: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT app FROM minute_apps
+             WHERE minute >= ?1 AND minute <= ?2 AND trim(app) <> ''
+             ORDER BY app COLLATE NOCASE, app",
+        )?;
+        let rows = stmt.query_map(params![from, to], |row| row.get::<_, String>(0))?;
+        let mut apps = Vec::new();
+        for row in rows {
+            let app = row?;
+            if !apps
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&app))
+            {
+                apps.push(app);
+            }
+        }
+        Ok(apps)
+    }
+
+    fn filtered_report_parts(
+        &self,
+        from: i64,
+        to: i64,
+        bar_mode: BarMode,
+        breakdown: &str,
+        groups: &[CustomAppGroup],
+        route_filter: Option<HistoryRouteFilter>,
+        subject_filter: Option<&HistorySubjectFilter>,
+    ) -> Result<(u64, u64, u64, Vec<HistoryBar>, Vec<HistoryRow>)> {
+        let mut total_stmt = self.conn.prepare(
+            "SELECT minute, download, upload, gap FROM minute_totals
+             WHERE minute >= ?1 AND minute <= ?2 ORDER BY minute",
+        )?;
+        let total_rows = total_stmt.query_map(params![from, to], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut totals_by_minute = BTreeMap::new();
+        let mut gap_minutes = 0u64;
+        let mut buckets: BTreeMap<i64, (u64, u64, bool)> = bar_bucket_starts(from, to, bar_mode)
+            .into_iter()
+            .map(|start| (start, (0, 0, false)))
+            .collect();
+        for row in total_rows {
+            let (minute, download, upload, gap) = row?;
+            totals_by_minute.insert(
+                minute,
+                (
+                    u64::try_from(download.max(0)).unwrap_or(0),
+                    u64::try_from(upload.max(0)).unwrap_or(0),
+                ),
+            );
+            if gap != 0 {
+                gap_minutes = gap_minutes.saturating_add(1);
+                buckets
+                    .entry(bar_bucket_start(minute, bar_mode))
+                    .or_default()
+                    .2 = true;
+            }
+        }
+
+        let mut sample_stmt = self.conn.prepare(
+            "SELECT minute, app, route, route_class, download, upload FROM minute_apps
+             WHERE minute >= ?1 AND minute <= ?2 ORDER BY minute, app, route, route_class",
+        )?;
+        let sample_rows = sample_stmt.query_map(params![from, to], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut samples_by_minute: BTreeMap<i64, Vec<FilteredSample>> = BTreeMap::new();
+        for row in sample_rows {
+            let (minute, app, route, class, download, upload) = row?;
+            let route_class = route_class_from_db(&class);
+            let route_matches = match route_filter {
+                None => true,
+                Some(HistoryRouteFilter::Proxy) => route_class == RouteClass::Proxy,
+                Some(HistoryRouteFilter::Direct) => route_class == RouteClass::Direct,
+            };
+            let subject_matches = match subject_filter {
+                None => true,
+                Some(HistorySubjectFilter::App { name }) => app.eq_ignore_ascii_case(name),
+                Some(HistorySubjectFilter::Group { id }) => groups
+                    .iter()
+                    .find(|group| group.id == *id)
+                    .is_some_and(|group| {
+                        group
+                            .apps
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(&app))
+                    }),
+            };
+            if route_matches && subject_matches {
+                samples_by_minute
+                    .entry(minute)
+                    .or_default()
+                    .push(FilteredSample {
+                        app,
+                        route,
+                        route_class,
+                        download: u64::try_from(download.max(0)).unwrap_or(0),
+                        upload: u64::try_from(upload.max(0)).unwrap_or(0),
+                    });
+            }
+        }
+
+        let mut total_download = 0u64;
+        let mut total_upload = 0u64;
+        let mut aggregate: BTreeMap<
+            (String, RouteClass),
+            (u64, u64, Option<String>, Option<String>),
+        > = BTreeMap::new();
+        for (minute, samples) in samples_by_minute {
+            let (limit_download, limit_upload) =
+                totals_by_minute.get(&minute).copied().unwrap_or_default();
+            let estimated_download: u128 =
+                samples.iter().map(|sample| sample.download as u128).sum();
+            let estimated_upload: u128 = samples.iter().map(|sample| sample.upload as u128).sum();
+            let bucket = buckets
+                .entry(bar_bucket_start(minute, bar_mode))
+                .or_default();
+            for sample in samples {
+                let download = if estimated_download > limit_download as u128 {
+                    scale_to_total(sample.download, limit_download, estimated_download)
+                } else {
+                    sample.download
+                };
+                let upload = if estimated_upload > limit_upload as u128 {
+                    scale_to_total(sample.upload, limit_upload, estimated_upload)
+                } else {
+                    sample.upload
+                };
+                total_download = total_download.saturating_add(download);
+                total_upload = total_upload.saturating_add(upload);
+                bucket.0 = bucket.0.saturating_add(download);
+                bucket.1 = bucket.1.saturating_add(upload);
+
+                let (label, app, route) = row_identity(
+                    breakdown,
+                    &sample.app,
+                    &sample.route,
+                    groups,
+                    subject_filter,
+                );
+                let entry = aggregate
+                    .entry((label, sample.route_class))
+                    .or_insert((0, 0, app, route));
+                entry.0 = entry.0.saturating_add(download);
+                entry.1 = entry.1.saturating_add(upload);
+            }
+        }
+
+        let mut rows = aggregate
+            .into_iter()
+            .map(
+                |((label, route_class), (download, upload, app, route))| HistoryRow {
+                    label,
+                    app,
+                    route,
+                    route_class,
+                    download,
+                    upload,
+                    total: download.saturating_add(upload),
+                },
+            )
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .total
+                .cmp(&left.total)
+                .then(left.label.cmp(&right.label))
+        });
+        let bars = buckets
+            .into_iter()
+            .map(|(start, (download, upload, gap))| HistoryBar {
+                start,
+                label: bar_label(start, bar_mode),
+                download,
+                upload,
+                gap,
+            })
+            .collect();
+        Ok((total_download, total_upload, gap_minutes, bars, rows))
     }
 
     fn build_rows(
@@ -368,6 +603,46 @@ fn route_class_from_db(class: &str) -> RouteClass {
         "direct" => RouteClass::Direct,
         "blocked" => RouteClass::Blocked,
         _ => RouteClass::Unknown,
+    }
+}
+
+fn row_identity(
+    breakdown: &str,
+    app: &str,
+    route: &str,
+    groups: &[CustomAppGroup],
+    subject_filter: Option<&HistorySubjectFilter>,
+) -> (String, Option<String>, Option<String>) {
+    match breakdown {
+        "customGroup" => {
+            let selected_group_id = match subject_filter {
+                Some(HistorySubjectFilter::Group { id }) => Some(id.as_str()),
+                _ => None,
+            };
+            let group = selected_group_id
+                .and_then(|id| groups.iter().find(|group| group.id == id))
+                .filter(|group| {
+                    group
+                        .apps
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(app))
+                })
+                .or_else(|| {
+                    groups.iter().find(|group| {
+                        group
+                            .apps
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(app))
+                    })
+                });
+            let label = group
+                .map(|group| group.name.clone())
+                .unwrap_or_else(|| app.to_owned());
+            let app_field = group.is_none().then(|| app.to_owned());
+            (label, app_field, None)
+        }
+        "route" => (route.to_owned(), None, Some(route.to_owned())),
+        _ => (app.to_owned(), Some(app.to_owned()), None),
     }
 }
 
@@ -729,6 +1004,202 @@ mod tests {
     }
 
     #[test]
+    fn route_and_group_filters_compose_and_keep_gaps() {
+        let mut history = memory();
+        let now = Local::now().timestamp();
+        let previous_minute = minute_start(now - 60);
+        let current_minute = minute_start(now);
+        history.record_totals(previous_minute, 100, 50).unwrap();
+        history.mark_gap(previous_minute).unwrap();
+        history
+            .record_apps(
+                previous_minute,
+                &[
+                    (
+                        "ChatGPT.exe".into(),
+                        "Proxy node".into(),
+                        RouteClass::Proxy,
+                        30,
+                        10,
+                    ),
+                    (
+                        "ChatGPT.exe".into(),
+                        "Direct".into(),
+                        RouteClass::Direct,
+                        20,
+                        10,
+                    ),
+                    (
+                        "codex.exe".into(),
+                        "Proxy node".into(),
+                        RouteClass::Proxy,
+                        50,
+                        30,
+                    ),
+                ],
+            )
+            .unwrap();
+        history.record_totals(current_minute, 100, 50).unwrap();
+        history
+            .record_apps(
+                current_minute,
+                &[
+                    (
+                        "ChatGPT.exe".into(),
+                        "Direct".into(),
+                        RouteClass::Direct,
+                        180,
+                        80,
+                    ),
+                    (
+                        "steam.exe".into(),
+                        "Direct".into(),
+                        RouteClass::Direct,
+                        20,
+                        10,
+                    ),
+                    (
+                        "codex.exe".into(),
+                        "Proxy node".into(),
+                        RouteClass::Proxy,
+                        10,
+                        5,
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let groups = vec![
+            CustomAppGroup {
+                id: "first-match".into(),
+                name: "First match".into(),
+                apps: vec!["ChatGPT.exe".into()],
+            },
+            CustomAppGroup {
+                id: "ai".into(),
+                name: "AI tools".into(),
+                apps: vec!["chatgpt.exe".into()],
+            },
+            CustomAppGroup {
+                id: "development".into(),
+                name: "Development".into(),
+                apps: vec!["CODEX.EXE".into()],
+            },
+        ];
+        let ai_filter = HistorySubjectFilter::Group { id: "ai".into() };
+        let filtered = history
+            .report_with_filters(
+                "7d",
+                "customGroup",
+                &groups,
+                now,
+                Some(HistoryRouteFilter::Direct),
+                Some(&ai_filter),
+            )
+            .unwrap();
+
+        assert_eq!((filtered.total_download, filtered.total_upload), (120, 60));
+        assert_eq!(
+            filtered.rows.iter().map(|row| row.download).sum::<u64>(),
+            filtered.total_download
+        );
+        assert_eq!(
+            filtered.rows.iter().map(|row| row.upload).sum::<u64>(),
+            filtered.total_upload
+        );
+        assert!(
+            filtered
+                .rows
+                .iter()
+                .all(|row| { row.label == "AI tools" && row.route_class == RouteClass::Direct })
+        );
+        assert!(!filtered.rows.iter().any(|row| row.label == "Unattributed"));
+        assert_eq!(
+            filtered.bars.iter().map(|bar| bar.download).sum::<u64>(),
+            filtered.total_download
+        );
+        assert_eq!(
+            filtered.bars.iter().map(|bar| bar.upload).sum::<u64>(),
+            filtered.total_upload
+        );
+        assert_eq!(filtered.gap_minutes, 1);
+        assert!(filtered.bars.iter().any(|bar| {
+            bar.gap && bar.start == bar_bucket_start(previous_minute, BarMode::Day)
+        }));
+        assert_eq!(
+            filtered.available_apps,
+            vec!["ChatGPT.exe", "codex.exe", "steam.exe"]
+        );
+
+        let no_match = history
+            .report_with_filters(
+                "7d",
+                "app",
+                &groups,
+                now,
+                Some(HistoryRouteFilter::Direct),
+                Some(&HistorySubjectFilter::Group {
+                    id: "development".into(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(no_match.total, 0);
+        assert!(no_match.rows.is_empty());
+        assert_eq!(no_match.gap_minutes, 1);
+        assert!(no_match.bars.iter().any(|bar| bar.gap));
+        assert_eq!(no_match.available_apps, filtered.available_apps);
+    }
+
+    #[test]
+    fn app_filter_is_case_insensitive_and_uses_only_attributed_samples() {
+        let mut history = memory();
+        let now = Local::now().timestamp();
+        history.record_totals(now, 100, 50).unwrap();
+        history
+            .record_apps(
+                now,
+                &[
+                    (
+                        "Steam.exe".into(),
+                        "Direct".into(),
+                        RouteClass::Direct,
+                        20,
+                        10,
+                    ),
+                    (
+                        "ChatGPT.exe".into(),
+                        "Proxy node".into(),
+                        RouteClass::Proxy,
+                        30,
+                        20,
+                    ),
+                ],
+            )
+            .unwrap();
+        let app_filter = HistorySubjectFilter::App {
+            name: "STEAM.EXE".into(),
+        };
+        let filtered = history
+            .report_with_filters(
+                "today",
+                "route",
+                &[],
+                now,
+                Some(HistoryRouteFilter::Direct),
+                Some(&app_filter),
+            )
+            .unwrap();
+        assert_eq!((filtered.total_download, filtered.total_upload), (20, 10));
+        assert_eq!(filtered.rows.len(), 1);
+        assert_eq!(filtered.rows[0].label, "Direct");
+        assert_eq!(filtered.rows[0].route_class, RouteClass::Direct);
+        assert_eq!(
+            filtered.bars.iter().map(|bar| bar.download).sum::<u64>(),
+            20
+        );
+    }
+
+    #[test]
     fn legacy_rows_migrate_without_losing_totals_or_route_meaning() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.sqlite3");
@@ -776,5 +1247,19 @@ mod tests {
                 .any(|row| row.label == "Falemon / Hong Kong"
                     && row.route_class == RouteClass::Proxy)
         );
+
+        let direct = history
+            .report_with_filters(
+                "today",
+                "route",
+                &[],
+                1_800_000_000,
+                Some(HistoryRouteFilter::Direct),
+                None,
+            )
+            .unwrap();
+        assert_eq!((direct.total_download, direct.total_upload), (10, 4));
+        assert_eq!(direct.rows.len(), 1);
+        assert_eq!(direct.rows[0].route_class, RouteClass::Direct);
     }
 }

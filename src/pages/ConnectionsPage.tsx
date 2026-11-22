@@ -3,7 +3,7 @@ import { useLive } from '../hooks'
 import { formatRate } from '../lib/format'
 import type { Snapshot } from '../types'
 import { Icon } from '../components/Icon'
-import { EmptyState, PageHeader } from '../components/ui'
+import { EmptyState, PageHeader, Panel, Toolbar } from '../components/ui'
 
 export function ConnectionsPage({ snapshot }: { snapshot: Snapshot }) {
   const live = useLive(true)
@@ -35,9 +35,9 @@ export function ConnectionsPage({ snapshot }: { snapshot: Snapshot }) {
           </span>
         }
       />
-      <div className="filters-row">
+      <Toolbar className="filters-row">
         <label className="search-field">
-          <Icon name="search" size={21} />
+          <Icon name="search" size={18} />
           <span className="sr-only">Search app or destination</span>
           <input value={search} placeholder="Search app or destination" onChange={(event) => setSearch(event.target.value)} />
         </label>
@@ -48,9 +48,10 @@ export function ConnectionsPage({ snapshot }: { snapshot: Snapshot }) {
             {routes.map((route) => <option value={route} key={route}>{route}</option>)}
           </select>
         </label>
-      </div>
+        <span className="toolbar-meta">{filtered.length} shown</span>
+      </Toolbar>
 
-      <section className="panel connections-panel">
+      <Panel className="connections-panel">
         {!snapshot.runtime.vpnActive || live.connections.length === 0 ? (
           <EmptyState
             title={snapshot.runtime.vpnActive ? 'No active flows' : 'VPN is off'}
@@ -90,7 +91,7 @@ export function ConnectionsPage({ snapshot }: { snapshot: Snapshot }) {
             </tbody>
           </table>
         )}
-      </section>
+      </Panel>
     </div>
   )
 }
