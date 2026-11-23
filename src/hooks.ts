@@ -4,6 +4,7 @@ import type { LiveRates, LiveSnapshot } from './types'
 
 const emptyLive: LiveSnapshot = {
   active: false,
+  available: false,
   downloadRate: 0,
   uploadRate: 0,
   downloadTotal: 0,
@@ -14,10 +15,9 @@ const emptyLive: LiveSnapshot = {
 
 const emptyRates: LiveRates = {
   active: false,
-  downloadRate: 0,
-  uploadRate: 0,
-  downloadTotal: 0,
-  uploadTotal: 0,
+  available: false,
+  proxyDownloadRate: 0,
+  proxyUploadRate: 0,
   sampledAt: 0,
 }
 
@@ -73,12 +73,12 @@ export function useLiveRates(enabled = true): LiveRates {
 }
 
 export function useRatePoints(
-  live: Pick<LiveSnapshot, 'active' | 'downloadRate' | 'uploadRate' | 'sampledAt'>,
+  live: Pick<LiveRates, 'active' | 'available' | 'proxyDownloadRate' | 'proxyUploadRate' | 'sampledAt'>,
   limit = 60,
 ): Array<{ at: number; download: number; upload: number }> {
   const [points, setPoints] = useState<Array<{ at: number; download: number; upload: number }>>([])
   useEffect(() => {
-    if (!live.active) {
+    if (!live.active || !live.available) {
       setPoints([])
       return
     }
@@ -87,10 +87,10 @@ export function useRatePoints(
       if (current.some((point) => point.at === live.sampledAt)) return current
       return [
         ...current,
-        { at: live.sampledAt, download: live.downloadRate, upload: live.uploadRate },
+        { at: live.sampledAt, download: live.proxyDownloadRate, upload: live.proxyUploadRate },
       ].slice(-limit)
     })
-  }, [limit, live.active, live.downloadRate, live.sampledAt, live.uploadRate])
+  }, [limit, live.active, live.available, live.proxyDownloadRate, live.sampledAt, live.proxyUploadRate])
   return points
 }
 
@@ -98,6 +98,15 @@ export function useNow(intervalMs = 1000): number {
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), intervalMs)
+    return () => window.clearInterval(timer)
+  }, [intervalMs])
+  return now
+}
+
+export function useNowMs(intervalMs = 1000): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), intervalMs)
     return () => window.clearInterval(timer)
   }, [intervalMs])
   return now

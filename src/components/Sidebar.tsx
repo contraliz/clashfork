@@ -50,7 +50,7 @@ export function Sidebar({
         <span className="sidebar-foot-text">
           {runtime.serviceAvailable ? 'TUN service ready' : runtime.serviceMessage ? 'TUN service unavailable' : 'TUN service check'}
         </span>
-        <span className="version">1.0.4</span>
+        <span className="version">1.0.11</span>
       </div>
     </aside>
   )

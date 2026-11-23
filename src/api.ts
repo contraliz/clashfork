@@ -8,6 +8,8 @@ import type {
   ImportPreview,
   LiveRates,
   LiveSnapshot,
+  NodeTestProgress,
+  NodeTestSummary,
   SaveMatchGroupInput,
   SaveRulesetInput,
   Selection,
@@ -38,6 +40,8 @@ export const emptySnapshot = (): Snapshot => ({
       'The Clashfork service is not installed. Reinstall Clashfork to enable the TUN VPN.',
     lastError: null,
     activeSummary: null,
+    competingTunnel: false,
+    pendingReconnectServices: [],
   },
 })
 
@@ -75,6 +79,9 @@ export const api = {
     call<Snapshot>('confirm_import', { previewId, title: title || null }),
   refreshService: (serviceId: string) =>
     call<Snapshot>('refresh_service', { serviceId }),
+  testNode: (nodeId: string) => call<Snapshot>('test_node', { nodeId }),
+  testAllNodes: () => call<NodeTestSummary>('test_all_nodes'),
+  cancelNodeTestSweep: () => call<void>('cancel_node_test_sweep'),
   renameService: (serviceId: string, title: string) =>
     call<Snapshot>('rename_service', { serviceId, title }),
   saveMatchGroup: (input: SaveMatchGroupInput) =>
@@ -113,4 +120,16 @@ export async function subscribeErrors(
 ): Promise<UnlistenFn | null> {
   if (!isTauri) return null
   return listen<string>('backend-error', (event) => handler(event.payload))
+}
+
+export async function subscribeNodeTestProgress(
+  handler: (progress: NodeTestProgress) => void,
+): Promise<UnlistenFn | null> {
+  if (isTauri) return listen<NodeTestProgress>('node-test-progress', (event) => handler(event.payload))
+  if (!useMock || typeof window === 'undefined') return null
+  const eventHandler = (event: Event) => {
+    if (event instanceof CustomEvent) handler(event.detail as NodeTestProgress)
+  }
+  window.addEventListener('clashfork:node-test-progress', eventHandler)
+  return () => window.removeEventListener('clashfork:node-test-progress', eventHandler)
 }

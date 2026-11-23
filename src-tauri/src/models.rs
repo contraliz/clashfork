@@ -54,6 +54,9 @@ pub struct ServiceView {
     pub allowance: Allowance,
     #[serde(default)]
     pub stale: bool,
+    /// Referenced nodes omitted from the most recent successful source fetch.
+    #[serde(default)]
+    pub omitted_node_ids: Vec<String>,
     pub last_refresh_at: Option<i64>,
     pub last_error: Option<String>,
 }
@@ -75,7 +78,13 @@ pub struct NodeView {
     pub display_name: String,
     pub protocol: String,
     pub missing: bool,
+    #[serde(default)]
+    pub omitted_once: bool,
     pub core_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_measured_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,16 +139,67 @@ impl Default for Destination {
 #[serde(rename_all = "camelCase")]
 pub struct RulesetEntry {
     pub id: String,
+    #[serde(default)]
     pub match_group_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub conditions: Vec<MatchCondition>,
     pub destination: Destination,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Miscellaneous {
-    #[default]
     Direct,
     Block,
+    Node { node_id: String },
+}
+
+impl Default for Miscellaneous {
+    fn default() -> Self {
+        Self::Direct
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum LegacyMiscellaneous {
+    Direct,
+    Block,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MiscellaneousInput {
+    Legacy(LegacyMiscellaneous),
+    Destination(Destination),
+}
+
+impl Serialize for Miscellaneous {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Direct => Destination::Direct,
+            Self::Block => Destination::Block,
+            Self::Node { node_id } => Destination::Node {
+                node_id: node_id.clone(),
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Miscellaneous {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match MiscellaneousInput::deserialize(deserializer)? {
+            MiscellaneousInput::Legacy(LegacyMiscellaneous::Direct) => Ok(Self::Direct),
+            MiscellaneousInput::Legacy(LegacyMiscellaneous::Block) => Ok(Self::Block),
+            MiscellaneousInput::Destination(Destination::Direct) => Ok(Self::Direct),
+            MiscellaneousInput::Destination(Destination::Block) => Ok(Self::Block),
+            MiscellaneousInput::Destination(Destination::Node { node_id }) => {
+                Ok(Self::Node { node_id })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,7 +254,7 @@ pub struct AppState {
 }
 
 fn default_schema_version() -> u32 {
-    1
+    2
 }
 
 impl Default for AppState {
@@ -231,6 +291,10 @@ pub struct RuntimeView {
     pub service_message: Option<String>,
     pub last_error: Option<String>,
     pub active_summary: Option<String>,
+    #[serde(default)]
+    pub competing_tunnel: bool,
+    #[serde(default)]
+    pub pending_reconnect_services: Vec<String>,
 }
 
 impl Default for RuntimeView {
@@ -245,6 +309,8 @@ impl Default for RuntimeView {
             ),
             last_error: None,
             active_summary: None,
+            competing_tunnel: false,
+            pending_reconnect_services: Vec::new(),
         }
     }
 }
@@ -308,12 +374,43 @@ pub struct StoredSession {
     pub generation: u64,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StoredNodeLatency {
+    pub definition_fingerprint: String,
+    pub latency_ms: u64,
+    pub measured_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeTestProgress {
+    pub total: usize,
+    pub completed: usize,
+    pub responded: usize,
+    pub failed: usize,
+    pub node_id: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub finished: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeTestSummary {
+    pub total: usize,
+    pub completed: usize,
+    pub responded: usize,
+    pub failed: usize,
+    pub cancelled: bool,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SecretStore {
     #[serde(default)]
     pub subscriptions: BTreeMap<String, String>,
     #[serde(default)]
     pub nodes: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub node_latencies: BTreeMap<String, StoredNodeLatency>,
     #[serde(default)]
     pub last_session: Option<StoredSession>,
 }
@@ -338,6 +435,7 @@ pub struct LiveRoute {
 #[serde(rename_all = "camelCase")]
 pub struct LiveSnapshot {
     pub active: bool,
+    pub available: bool,
     pub download_rate: u64,
     pub upload_rate: u64,
     pub download_total: u64,
@@ -350,10 +448,9 @@ pub struct LiveSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct LiveRates {
     pub active: bool,
-    pub download_rate: u64,
-    pub upload_rate: u64,
-    pub download_total: u64,
-    pub upload_total: u64,
+    pub available: bool,
+    pub proxy_download_rate: u64,
+    pub proxy_upload_rate: u64,
     pub sampled_at: i64,
 }
 
@@ -373,11 +470,10 @@ mod live_rates_tests {
                 .collect::<Vec<_>>(),
             [
                 "active",
-                "downloadRate",
-                "downloadTotal",
+                "available",
+                "proxyDownloadRate",
+                "proxyUploadRate",
                 "sampledAt",
-                "uploadRate",
-                "uploadTotal",
             ]
         );
     }
@@ -390,6 +486,10 @@ pub struct HistoryBar {
     pub label: String,
     pub download: u64,
     pub upload: u64,
+    #[serde(default)]
+    pub proxy_total: u64,
+    #[serde(default)]
+    pub direct_total: u64,
     pub gap: bool,
 }
 

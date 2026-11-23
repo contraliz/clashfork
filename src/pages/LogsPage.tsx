@@ -150,7 +150,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
   }, [onError, tab, visible])
 
   const max = useMemo(
-    () => Math.max(1, ...(report?.bars.flatMap((bar) => [bar.download, bar.upload]) ?? [1])),
+    () => Math.max(1, ...(report?.bars.flatMap((bar) => [bar.proxyTotal, bar.directTotal]) ?? [1])),
     [report],
   )
   const eligibleGroups = useMemo(
@@ -297,8 +297,8 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                   title="Traffic history"
                   actions={
                     <div className="chart-legend">
-                      <span><i className="legend-download" /> Download</span>
-                      <span><i className="legend-upload" /> Upload</span>
+                      <span><i className="legend-proxy" /> Proxy</span>
+                      <span><i className="legend-direct" /> Direct</span>
                     </div>
                   }
                 />
@@ -308,8 +308,8 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                       {inspectedPeriod ? (
                         <>
                           <strong>{historyPeriodLabel(inspectedPeriod, range)}</strong>
-                          <span><i className="legend-download" /> Download {formatBytes(inspectedPeriod.download)}</span>
-                          <span><i className="legend-upload" /> Upload {formatBytes(inspectedPeriod.upload)}</span>
+                          <span><i className="legend-proxy" /> Proxy {formatBytes(inspectedPeriod.proxyTotal)}</span>
+                          <span><i className="legend-direct" /> Direct {formatBytes(inspectedPeriod.directTotal)}</span>
                           <span className={inspectedPeriod.gap ? 'has-recording-gap' : ''}>
                             {inspectedPeriod.gap ? 'Recording gap' : 'No recording gap'}
                           </span>
@@ -323,10 +323,10 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                         {[1, 0.75, 0.5, 0.25, 0].map((fraction) => <span key={fraction}>{formatBytes(max * fraction)}</span>)}
                       </div>
                       <div className="bar-chart-scroll" onMouseLeave={() => setInspectedPeriod(null)}>
-                        <div className="bar-chart" style={{ minWidth: `${Math.max(430, report.bars.length * (range === '30d' ? 24 : 52))}px` }}>
+                        <div className="bar-chart" style={{ minWidth: `${Math.max(430, report.bars.length * (range === '30d' ? 34 : 52))}px` }}>
                           {report.bars.map((bar) => {
                             const periodLabel = historyPeriodLabel(bar, range)
-                            const description = `${periodLabel}. Download ${formatBytes(bar.download)}. Upload ${formatBytes(bar.upload)}. ${bar.gap ? 'Recording gap in this period.' : 'No recording gap recorded for this period.'}`
+                            const description = `${periodLabel}. Proxy ${formatBytes(bar.proxyTotal)}. Direct ${formatBytes(bar.directTotal)}. ${bar.gap ? 'Recording gap in this period.' : 'No recording gap recorded for this period.'}`
                             return (
                               <button
                                 type="button"
@@ -336,6 +336,8 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                                 aria-label={description}
                                 data-history-bar-download={bar.download}
                                 data-history-bar-upload={bar.upload}
+                                data-history-bar-proxy={bar.proxyTotal}
+                                data-history-bar-direct={bar.directTotal}
                                 data-history-bar-gap={bar.gap ? 'true' : 'false'}
                                 onMouseEnter={() => setInspectedPeriod(bar)}
                                 onFocus={() => setInspectedPeriod(bar)}
@@ -344,9 +346,9 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                                   if (event.key === 'Escape') setInspectedPeriod(null)
                                 }}
                               >
-                                <span className="bar-stack" aria-hidden="true">
-                                  <span className="bar bar-download" style={{ height: `${(bar.download / max) * 100}%` }} />
-                                  <span className="bar bar-upload" style={{ height: `${(bar.upload / max) * 100}%` }} />
+                                <span className="bar-route-pair" aria-hidden="true">
+                                  <span className="bar-route-slot" data-history-route="proxy"><span className="bar bar-proxy" style={{ height: `${(bar.proxyTotal / max) * 100}%` }} /></span>
+                                  <span className="bar-route-slot" data-history-route="direct"><span className="bar bar-direct" style={{ height: `${(bar.directTotal / max) * 100}%` }} /></span>
                                 </span>
                                 <span className={`bar-label ${bar.gap ? 'has-gap' : ''}`} aria-hidden="true">{bar.label}{bar.gap ? ' ·' : ''}</span>
                               </button>

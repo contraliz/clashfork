@@ -3,6 +3,7 @@ mod controller;
 mod diagnostics;
 mod history;
 mod models;
+mod network;
 mod paths;
 mod rules;
 mod runtime;
@@ -39,6 +40,9 @@ pub fn run() {
             commands::cancel_import,
             commands::confirm_import,
             commands::refresh_service,
+            commands::test_node,
+            commands::test_all_nodes,
+            commands::cancel_node_test_sweep,
             commands::rename_service,
             commands::save_match_group,
             commands::delete_match_group,

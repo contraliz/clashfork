@@ -2,6 +2,7 @@ import type {
   Allowance,
   AppState,
   CustomAppGroup,
+  Destination,
   HistoryInput,
   HistoryReport,
   ImportPreview,
@@ -15,6 +16,18 @@ import type {
 const now = () => Math.floor(Date.now() / 1000)
 const useEmptyRulesetFixture =
   typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('fixture') === 'empty-rulesets'
+const useCompetingTunnelFixture =
+  typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('fixture') === 'competing-tunnel'
+const useRefreshFailureFixture =
+  typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('fixture') === 'refresh-soft-failure'
+const useActionableMissingFixture =
+  typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('fixture') === 'actionable-missing'
+const useLatencyFailureFixture =
+  typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('fixture') === 'latency-failure'
+const useStaleLatencyFixture =
+  typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('fixture') === 'latency-stale'
+const useGlobalUnselectedFixture =
+  typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('fixture') === 'global-unselected'
 
 function trackMockPending<T>(command: string, promise: Promise<T>): Promise<T> {
   const qaWindow = typeof window === 'undefined'
@@ -38,6 +51,7 @@ const services: ServiceView[] = [
     sourceHost: 'fixture-subscription.invalid',
     nodeCount: 3,
     missingCount: 0,
+    omittedNodeIds: [],
     allowance: {
       kind: 'full',
       total: 100 * 1024 ** 3,
@@ -57,6 +71,7 @@ const services: ServiceView[] = [
     sourceHost: 'nodes.northwind.invalid',
     nodeCount: 2,
     missingCount: 0,
+    omittedNodeIds: [],
     allowance: {
       kind: 'remaining',
       remaining: 41 * 1024 ** 3,
@@ -64,7 +79,7 @@ const services: ServiceView[] = [
     },
     stale: true,
     lastRefreshAt: now() - 26 * 3600,
-    lastError: 'The last refresh failed. Showing the last known-good nodes and allowance.',
+    lastError: null,
   },
 ]
 
@@ -81,6 +96,7 @@ const node = (
   displayName,
   protocol,
   missing: false,
+  omittedOnce: false,
   coreName: `CF-${id}`,
 })
 
@@ -91,6 +107,17 @@ let nodes: NodeView[] = [
   node('node_northwind_sg', 'service_northwind', 'Northwind', 'Singapore I0', 'Trojan'),
   node('node_northwind_osaka', 'service_northwind', 'Northwind', 'Osaka 01', 'Shadowsocks'),
 ]
+
+if (useStaleLatencyFixture) {
+  nodes[0].latencyMs = 142
+  nodes[0].latencyMeasuredAtMs = Date.now() - 15 * 60 * 1000
+}
+
+if (useActionableMissingFixture) {
+  nodes[0].missing = true
+  services[0].missingCount = 1
+  services[0].lastError = 'An active node disappeared from this subscription. Choose a replacement before the next activation.'
+}
 
 let customGroups: CustomAppGroup[] = [
   { id: 'appgroup_dev', name: 'Development', apps: ['codex.exe', 'code.exe'] },
@@ -124,10 +151,12 @@ let state: AppState = {
         {
           id: 'entry_openai',
           matchGroupId: 'group_openai',
+          name: 'OpenAI',
+          conditions: [{ id: 'c1', kind: 'domain_suffix', value: 'openai.com' }],
           destination: { kind: 'node', nodeId: 'node_falemon_sg' },
         },
       ],
-      miscellaneous: 'direct',
+      miscellaneous: { kind: 'direct' },
     },
     {
       id: 'ruleset_work',
@@ -136,10 +165,12 @@ let state: AppState = {
         {
           id: 'entry_work',
           matchGroupId: 'group_work',
+          name: 'Work apps',
+          conditions: [{ id: 'c4', kind: 'domain_suffix', value: 'notion.so' }],
           destination: { kind: 'node', nodeId: 'node_northwind_osaka' },
         },
       ],
-      miscellaneous: 'direct',
+      miscellaneous: { kind: 'direct' },
     },
   ],
   presets: useEmptyRulesetFixture ? [] : [
@@ -160,6 +191,8 @@ let state: AppState = {
   historyPaused: false,
 }
 
+if (useGlobalUnselectedFixture) state.selection.globalNodeId = null
+
 const runtime: Snapshot['runtime'] = {
   vpnActive: false,
   coreStatus: 'off',
@@ -167,6 +200,8 @@ const runtime: Snapshot['runtime'] = {
   serviceMessage: null,
   lastError: null,
   activeSummary: useEmptyRulesetFixture ? null : 'Rule · AI',
+  competingTunnel: useCompetingTunnelFixture,
+  pendingReconnectServices: [],
 }
 
 function snapshot(): Snapshot {
@@ -190,6 +225,21 @@ function delay<T>(value: T): Promise<T> {
 
 const previews = new Map<string, ImportPreview>()
 let liveTick = 0
+let cancelNodeTests = false
+
+function emitNodeTestProgress(progress: {
+  total: number
+  completed: number
+  responded: number
+  failed: number
+  nodeId: string | null
+  latencyMs: number | null
+  finished: boolean
+}) {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('clashfork:node-test-progress', { detail: progress }))
+  }
+}
 
 const pendingPreview = (id: string, nodes: ImportPreview['nodes'], sourceType: ImportPreview['sourceType'], title: string, host: string | null, allowance: Allowance): ImportPreview => ({
   id,
@@ -294,6 +344,7 @@ export async function invoke(command: string, args?: Record<string, unknown>): P
         sourceHost: preview.sourceHost,
         nodeCount: preview.nodeCount,
         missingCount: 0,
+        omittedNodeIds: [],
         allowance: preview.allowance,
         stale: false,
         lastRefreshAt: now(),
@@ -329,11 +380,62 @@ export async function invoke(command: string, args?: Record<string, unknown>): P
       const id = String(args?.serviceId)
       const service = state.services.find((item) => item.id === id)
       if (!service) throw new Error('The service no longer exists.')
-      service.stale = false
-      service.lastRefreshAt = now()
-      service.lastError = null
+      if (useRefreshFailureFixture) {
+        service.stale = true
+        service.lastError = null
+      } else {
+        service.stale = false
+        service.lastRefreshAt = now()
+        service.lastError = null
+      }
       return delay(snapshot())
     }
+    case 'test_node': {
+      if (!runtime.vpnActive) throw new Error('Connect Clashfork before testing nodes.')
+      if (useLatencyFailureFixture) throw new Error('No response from this node.')
+      const nodeId = String(args?.nodeId ?? '')
+      const selected = state.nodes.find((item) => item.id === nodeId && !item.missing)
+      if (!selected) throw new Error('This node is unavailable.')
+      selected.latencyMs = nodeId === 'node_falemon_sg' ? 142 : 187
+      selected.latencyMeasuredAtMs = Date.now()
+      return delay(snapshot())
+    }
+    case 'test_all_nodes': {
+      if (!runtime.vpnActive) throw new Error('Connect Clashfork before testing nodes.')
+      cancelNodeTests = false
+      const candidates = state.nodes.filter((item) => !item.missing)
+      const total = candidates.length
+      let completed = 0
+      let responded = 0
+      let failed = 0
+      emitNodeTestProgress({ total, completed, responded, failed, nodeId: null, latencyMs: null, finished: total === 0 })
+      let nextIndex = 0
+      const worker = async () => {
+        for (;;) {
+          if (cancelNodeTests) return
+          const index = nextIndex++
+          const candidate = candidates[index]
+          if (!candidate) return
+          await new Promise((resolve) => setTimeout(resolve, 140))
+          const shouldFail = useLatencyFailureFixture && candidate.id === 'node_northwind_osaka'
+          const latencyMs = shouldFail ? null : candidate.id === 'node_falemon_sg' ? 142 : 187
+          if (latencyMs === null) failed += 1
+          else {
+            responded += 1
+            candidate.latencyMs = latencyMs
+            candidate.latencyMeasuredAtMs = Date.now()
+          }
+          completed += 1
+          emitNodeTestProgress({ total, completed, responded, failed, nodeId: candidate.id, latencyMs, finished: false })
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(4, total) }, worker))
+      emitNodeTestProgress({ total, completed, responded, failed, nodeId: null, latencyMs: null, finished: true })
+      return delay({ total, completed, responded, failed, cancelled: cancelNodeTests })
+    }
+    case 'cancel_node_test_sweep':
+      cancelNodeTests = true
+      return undefined
     case 'save_match_group': {
       const input = args?.input as {
         id: string | null
@@ -368,7 +470,7 @@ export async function invoke(command: string, args?: Record<string, unknown>): P
         id: string | null
         name: string
         entries: AppState['rulesets'][number]['entries']
-        miscellaneous: 'direct' | 'block'
+        miscellaneous: Destination
       }
       const name = input.name.trim()
       if (!name) throw new Error('Ruleset names cannot be empty.')
@@ -442,8 +544,18 @@ export async function invoke(command: string, args?: Record<string, unknown>): P
     case 'get_live':
       return trackMockPending('get_live', delay(live()))
     case 'get_live_rates': {
-      const { active, downloadRate, uploadRate, downloadTotal, uploadTotal, sampledAt } = live()
-      const rates: LiveRates = { active, downloadRate, uploadRate, downloadTotal, uploadTotal, sampledAt }
+      const current = live()
+      const proxyRows = current.connections.filter((item) => item.route.startsWith('Falemon /'))
+      const rates: LiveRates = {
+        active: current.active,
+        available: current.active,
+        proxyDownloadRate: proxyRows.reduce((sum, item) => sum + item.downloadRate, 0),
+        proxyUploadRate: proxyRows.reduce((sum, item) => sum + item.uploadRate, 0),
+        sampledAt: current.sampledAt,
+      }
+      if (typeof window !== 'undefined') {
+        (window as Window & { __clashforkMockLastRates?: LiveRates }).__clashforkMockLastRates = rates
+      }
       return trackMockPending('get_live_rates', delay(rates))
     }
     case 'get_diagnostics':
@@ -493,6 +605,8 @@ function history(input: HistoryInput, groups: CustomAppGroup[]): HistoryReport {
         : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
       download: Math.round(wave * 1.1 * 1024 ** 3 * scale),
       upload: Math.round(wave * 0.22 * 1024 ** 3 * scale),
+      proxyTotal: 0,
+      directTotal: 0,
       gap: input.range === '30d' && index === 17,
     }
   })
@@ -530,6 +644,8 @@ function history(input: HistoryInput, groups: CustomAppGroup[]): HistoryReport {
     const estimatedUpload = samples.reduce((sum, sample) => sum + sample.upload, 0)
     let periodDownload = 0
     let periodUpload = 0
+    let proxyTotal = 0
+    let directTotal = 0
     for (const sample of samples) {
       const download = estimatedDownload > bar.download
         ? Math.floor(sample.download * bar.download / estimatedDownload)
@@ -539,6 +655,8 @@ function history(input: HistoryInput, groups: CustomAppGroup[]): HistoryReport {
         : sample.upload
       periodDownload += download
       periodUpload += upload
+      if (sample.routeClass === 'proxy') proxyTotal += download + upload
+      if (sample.routeClass === 'direct') directTotal += download + upload
       const group = subjectFilter?.kind === 'group' && selectedGroup?.apps.some((app) => app.toLowerCase() === sample.app.toLowerCase())
         ? selectedGroup
         : groups.find((candidate) => candidate.apps.some((app) => app.toLowerCase() === sample.app.toLowerCase()))
@@ -572,7 +690,13 @@ function history(input: HistoryInput, groups: CustomAppGroup[]): HistoryReport {
         rowsByKey.set(key, existing)
       }
     }
-    return { ...bar, download: filtered ? periodDownload : bar.download, upload: filtered ? periodUpload : bar.upload }
+    return {
+      ...bar,
+      download: filtered ? periodDownload : bar.download,
+      upload: filtered ? periodUpload : bar.upload,
+      proxyTotal,
+      directTotal,
+    }
   })
   const rows = [...rowsByKey.values()].sort((left, right) => right.total - left.total || left.label.localeCompare(right.label))
   const totalDownload = bars.reduce((sum, bar) => sum + bar.download, 0)
@@ -596,6 +720,7 @@ function live(): LiveSnapshot {
   if (!runtime.vpnActive) {
     return {
       active: false,
+      available: false,
       downloadRate: 0,
       uploadRate: 0,
       downloadTotal: 0,
@@ -660,6 +785,7 @@ function live(): LiveSnapshot {
   ]
   return {
     active: true,
+    available: true,
     downloadRate: connections.reduce((sum, item) => sum + item.downloadRate, 0),
     uploadRate: connections.reduce((sum, item) => sum + item.uploadRate, 0),
     downloadTotal: 80_302_000,

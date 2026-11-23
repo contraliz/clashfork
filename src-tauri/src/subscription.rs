@@ -7,18 +7,23 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde_yaml_ng::{Mapping, Value};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::OnceLock,
+    time::Duration,
 };
 use url::{Url, form_urlencoded};
 
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROVIDERS: usize = 12;
 const MAX_REDIRECTS: usize = 4;
+const MAX_FETCH_ATTEMPTS: usize = 3;
+const MAX_FETCH_ATTEMPT_TIME: Duration = Duration::from_secs(12);
+const MAX_FETCH_TIME: Duration = Duration::from_secs(40);
 const SUPPORTED_TYPES: [&str; 4] = ["trojan", "ss", "vmess", "vless"];
 const SUBSCRIPTION_ACCEPT: &str =
     "application/yaml, application/x-yaml, text/yaml, text/plain;q=0.9, */*;q=0.8";
@@ -70,6 +75,69 @@ struct FetchedResponse {
     body: String,
     headers: Vec<(String, String)>,
     summary: ResponseSummary,
+}
+
+#[derive(Debug)]
+struct RetryableSubscriptionError {
+    message: &'static str,
+    retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for RetryableSubscriptionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for RetryableSubscriptionError {}
+
+fn retryable_error(message: &'static str, retry_after: Option<Duration>) -> anyhow::Error {
+    anyhow::Error::new(RetryableSubscriptionError {
+        message,
+        retry_after,
+    })
+}
+
+async fn bounded_retry<T, F, Fut>(mut request: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + MAX_FETCH_TIME;
+    let mut last_error = None;
+    for attempt in 0..MAX_FETCH_ATTEMPTS {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_budget = remaining.min(MAX_FETCH_ATTEMPT_TIME);
+        let result = match tokio::time::timeout(attempt_budget, request()).await {
+            Ok(result) => result,
+            Err(_) => Err(retryable_error("The subscription request timed out.", None)),
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let Some(retryable) = error.downcast_ref::<RetryableSubscriptionError>() else {
+                    return Err(error);
+                };
+                let retry_after = retryable.retry_after;
+                last_error = Some(error);
+                if attempt + 1 == MAX_FETCH_ATTEMPTS {
+                    break;
+                }
+                let backoff = retry_after.unwrap_or_else(|| {
+                    Duration::from_millis(250u64.saturating_mul(1u64 << attempt))
+                });
+                let delay = backoff;
+                if delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
+                    break;
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("The subscription refresh timed out.")))
 }
 
 #[derive(Clone)]
@@ -190,10 +258,31 @@ async fn fetch_subscription(
     }) {
         bail!("The configured subscription host does not match the permitted provider host.");
     }
+    bounded_retry(|| fetch_subscription_once(client, &url, allowed_host)).await
+}
+
+async fn fetch_subscription_once(
+    client: &reqwest::Client,
+    url: &Url,
+    allowed_host: Option<&str>,
+) -> Result<ParsedSource> {
     let host = url.host_str().map(str::to_owned);
     let response = fetch_https(client, &url, None, allowed_host).await?;
-    let (document, shape) = parse_response_document(&response.body, response.summary.media_type)
-        .map_err(|error| format_response_parse_error(error, response.summary))?;
+    let (document, shape) =
+        match parse_response_document(&response.body, response.summary.media_type) {
+            Ok(document) => document,
+            Err(_error)
+                if response.summary.status == 200
+                    && response.summary.decoded_body_bytes <= 512
+                    && is_transient_interstitial(&response.body, response.summary.media_type) =>
+            {
+                return Err(retryable_error(
+                    "The subscription server returned a temporary HTML response.",
+                    None,
+                ));
+            }
+            Err(error) => return Err(format_response_parse_error(error, response.summary)),
+        };
     let mut raw_proxies = match &document {
         SubscriptionDocument::Profile(root) => {
             let mut proxies = Vec::new();
@@ -330,10 +419,18 @@ async fn fetch_https(
         if let Some(headers) = &current_headers {
             request = request.headers(headers.clone());
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| safe_request_error(&error))?;
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                retryable_error("The subscription request timed out.", None)
+            } else if error.is_connect() {
+                retryable_error(
+                    "The subscription server could not be reached over TLS.",
+                    None,
+                )
+            } else {
+                safe_request_error(&error)
+            }
+        })?;
         if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
             break response;
         }
@@ -360,10 +457,18 @@ async fn fetch_https(
         redirects_followed += 1;
     };
     if !response.status().is_success() {
-        bail!(
-            "The subscription server returned HTTP {}.",
-            response.status().as_u16()
-        );
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(parse_retry_after);
+        if retryable_http_status(status) {
+            return Err(retryable_error(
+                "The subscription server returned a temporary HTTP error.",
+                retry_after,
+            ));
+        }
+        bail!("The subscription server returned HTTP {status}.");
     }
     if let Some(length) = response.content_length()
         && length > MAX_BODY_BYTES as u64
@@ -401,8 +506,8 @@ async fn fetch_https(
     let mut body = Vec::new();
     use futures_util::StreamExt as _;
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|_| anyhow::anyhow!("The subscription download was interrupted."))?;
+        let chunk = chunk
+            .map_err(|_| retryable_error("The subscription download was interrupted.", None))?;
         if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
             bail!("The subscription response is larger than the 4 MB safety limit.");
         }
@@ -415,6 +520,10 @@ async fn fetch_https(
         headers,
         summary,
     })
+}
+
+fn retryable_http_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
 fn safe_media_type(raw: &str) -> &'static str {
@@ -620,6 +729,25 @@ fn looks_like_html_error_page(body: &str) -> bool {
         })
 }
 
+fn is_transient_interstitial(body: &str, media_type: &str) -> bool {
+    if media_type == "html" || looks_like_html_error_page(body) {
+        return true;
+    }
+    let body = body.trim().to_ascii_lowercase();
+    [
+        "temporarily unavailable",
+        "try again later",
+        "bad gateway",
+        "gateway timeout",
+        "upstream unavailable",
+        "upstream connect error",
+        "rate limit exceeded",
+        "connection reset",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
 fn mapping_sequence(value: &Value, error: &str) -> Result<Vec<Mapping>> {
     let Some(sequence) = value.as_sequence() else {
         bail!("{error}");
@@ -701,6 +829,17 @@ fn safe_request_error(error: &reqwest::Error) -> anyhow::Error {
     } else {
         anyhow::anyhow!("The subscription request failed.")
     }
+}
+
+fn parse_retry_after(value: &reqwest::header::HeaderValue) -> Option<Duration> {
+    let value = value.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let at = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    Some((at - Utc::now()).to_std().unwrap_or_default())
 }
 
 pub fn service_title(headers: &[(String, String)], host: Option<&str>) -> String {
@@ -1427,7 +1566,10 @@ pub fn prepend_nodes(
             display_name: node.display_name,
             protocol: node.protocol,
             missing: false,
+            omitted_once: false,
             core_name,
+            latency_ms: None,
+            latency_measured_at_ms: None,
         });
         secrets.nodes.insert(id, node.proxy);
     }
@@ -2087,6 +2229,7 @@ mod tests {
             missing_count: 0,
             allowance: Allowance::Unavailable,
             stale: false,
+            omitted_node_ids: Vec::new(),
             last_refresh_at: None,
             last_error: None,
         });
@@ -2097,7 +2240,10 @@ mod tests {
             display_name: node.display_name.clone(),
             protocol: node.protocol.clone(),
             missing: false,
+            omitted_once: false,
             core_name: node_core_name(&id),
+            latency_ms: None,
+            latency_measured_at_ms: None,
         });
         state.match_groups.push(MatchGroup {
             id: "g1".into(),
@@ -2126,6 +2272,8 @@ mod tests {
             entries: vec![RulesetEntry {
                 id: "e1".into(),
                 match_group_id: "g1".into(),
+                name: String::new(),
+                conditions: Vec::new(),
                 destination: Destination::Node {
                     node_id: id.clone(),
                 },
@@ -2585,5 +2733,112 @@ mod tests {
         );
         assert_eq!(rules[5], "DOMAIN-SUFFIX,chatgpt.com,REJECT");
         assert_eq!(rules.last().unwrap(), "MATCH,DIRECT");
+    }
+
+    #[tokio::test]
+    async fn bounded_fetch_retries_transient_fixture_then_recovers() {
+        let mut attempts = 0usize;
+        let result = bounded_retry(|| {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt == 1
+                    && is_transient_interstitial(
+                        "<html><body>temporary failure</body></html>",
+                        "html",
+                    )
+                {
+                    Err(retryable_error("temporary HTML fixture", None))
+                } else {
+                    Ok("fixture recovered")
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "fixture recovered");
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_fetch_stops_after_three_transient_failures() {
+        let mut attempts = 0usize;
+        let result: Result<()> = bounded_retry(|| {
+            attempts += 1;
+            async { Err(retryable_error("temporary fixture failure", None)) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts, MAX_FETCH_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn bounded_fetch_does_not_retry_permanent_auth_or_document_errors() {
+        let mut attempts = 0usize;
+        let result: Result<()> = bounded_retry(|| {
+            attempts += 1;
+            async { bail!("The subscription server returned HTTP 401.") }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn retry_after_accepts_numeric_and_http_date_values() {
+        let numeric = reqwest::header::HeaderValue::from_static("3");
+        assert_eq!(parse_retry_after(&numeric), Some(Duration::from_secs(3)));
+        let date = (Utc::now() + chrono::TimeDelta::seconds(10))
+            .to_rfc2822()
+            .parse::<reqwest::header::HeaderValue>()
+            .unwrap();
+        let parsed = parse_retry_after(&date).unwrap();
+        assert!(parsed > Duration::from_secs(8));
+        assert!(parsed <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn only_selected_transient_http_statuses_are_retried() {
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            assert!(retryable_http_status(status));
+        }
+        for status in [200, 301, 400, 401, 403, 404, 413] {
+            assert!(!retryable_http_status(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn server_backoff_longer_than_the_budget_returns_without_early_retry() {
+        let mut attempts = 0usize;
+        let result: Result<()> = bounded_retry(|| {
+            attempts += 1;
+            async {
+                Err(retryable_error(
+                    "temporary fixture failure",
+                    Some(Duration::from_secs(100)),
+                ))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn only_small_transient_error_pages_are_retryable_after_parse_failure() {
+        assert!(is_transient_interstitial(
+            "<html><body>Temporary failure</body></html>",
+            "plain-text"
+        ));
+        assert!(is_transient_interstitial(
+            "upstream temporarily unavailable",
+            "plain-text"
+        ));
+        assert!(parse_response_document("proxies: []", "html").is_ok());
+        assert!(!is_transient_interstitial("proxies: []", "plain-text"));
+        assert!(!is_transient_interstitial(
+            "this profile format is unsupported",
+            "plain-text"
+        ));
     }
 }

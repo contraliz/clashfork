@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { access, mkdtemp } from 'node:fs/promises'
+import { access, mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { chromium } from 'playwright-core'
@@ -78,6 +78,10 @@ try {
 
   await page.goto(url.href, { waitUntil: 'domcontentloaded' })
   await heading('Dashboard').waitFor()
+  await heading('Proxy traffic').waitFor()
+  await page.getByText('Proxy download', { exact: true }).first().waitFor()
+  await page.getByText('Proxy upload', { exact: true }).first().waitFor()
+  assert.equal(await page.getByRole('heading', { name: 'Live traffic', exact: true }).count(), 0, 'Dashboard traffic must be labeled as proxy-only')
   await waitForMockCalls('get_live_rates', 1)
   await page.waitForFunction(() => (window.__clashforkMockPendingCalls?.get_live_rates ?? 0) > 0)
   const initialRateCalls = await mockCalls('get_live_rates')
@@ -119,11 +123,48 @@ try {
   await page.getByText('Rule · AI', { exact: true }).first().waitFor()
   await page.locator('.chart-download[d*="L"]').waitFor()
   await page.waitForTimeout(3200)
+  const expectedProxyRates = await page.evaluate(() => {
+    const rates = window.__clashforkMockLastRates
+    const formatRate = (value) => {
+      if (!Number.isFinite(value) || value <= 0) return '0 B/s'
+      const units = ['B', 'KB', 'MB', 'GB', 'TB']
+      let amount = value
+      let unit = 0
+      while (amount >= 1024 && unit < units.length - 1) {
+        amount /= 1024
+        unit += 1
+      }
+      const formatted = amount >= 100 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)
+      return `${formatted} ${units[unit]}/s`
+    }
+    return {
+      download: formatRate(rates?.proxyDownloadRate ?? NaN),
+      upload: formatRate(rates?.proxyUploadRate ?? NaN),
+    }
+  })
+  assert.equal(await page.locator('.rate-block strong').nth(0).innerText(), expectedProxyRates.download, 'Dashboard must render only the proxy-class download rate from lightweight IPC')
+  assert.equal(await page.locator('.rate-block strong').nth(1).innerText(), expectedProxyRates.upload, 'Dashboard must render only the proxy-class upload rate from lightweight IPC')
   assert.equal(await mockCalls('get_live'), 0, 'Dashboard must poll only the lightweight rates endpoint')
   await capture('dashboard')
 
   await open('Nodes')
   await page.getByText('Falemon', { exact: true }).first().waitFor()
+  assert.equal(await page.locator('.service-error').count(), 0, 'usable cached nodes must not show routine refresh errors')
+  assert.equal(await mockCalls('test_node'), 0, 'opening Nodes must never trigger a latency probe')
+  assert.equal(await mockCalls('test_all_nodes'), 0, 'opening Nodes must never trigger a sweep')
+  const singaporeRow = page.locator('[data-node-id="node_falemon_sg"]')
+  await singaporeRow.getByRole('button', { name: 'Test Singapore I0 latency', exact: true }).click()
+  assert.equal(await mockCalls('test_node'), 1, 'an individual latency probe must be explicitly user initiated')
+  await singaporeRow.locator('.latency-value[data-latency-ms="142"]').waitFor()
+  assert.equal(await singaporeRow.locator('.latency-value').innerText(), '142 ms', 'individual node test must publish a measured latency')
+  await page.getByRole('button', { name: 'Test all nodes', exact: true }).click()
+  await page.getByText('5 of 5 responded', { exact: true }).waitFor()
+  assert.equal(await mockCalls('test_all_nodes'), 1, 'Test all nodes must run only after an explicit click')
+  await open('Dashboard')
+  await page.getByRole('button', { name: 'Global', exact: true }).click()
+  await page.locator('.picker-field .selected-node-latency .latency-value[data-latency-ms="142"]').waitFor()
+  assert.equal(await page.locator('.picker-field .selected-node-latency .latency-value').innerText(), '142 ms', 'Dashboard Global picker must share the cached node latency')
+  await open('Nodes')
   await capture('nodes')
   await page.getByRole('button', { name: 'Add Nodes', exact: true }).first().click()
   await page.getByRole('dialog').locator('textarea').fill('https://test.invalid/falemon')
@@ -134,7 +175,96 @@ try {
   await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click()
 
   await open('Rulesets')
-  await page.getByText('Miscellaneous', { exact: true }).first().waitFor()
+  await page.getByText('Everything else', { exact: true }).waitFor()
+  const ruleDraftName = page.getByRole('textbox', { name: 'Ruleset name', exact: true })
+  await ruleDraftName.fill('AI draft')
+  await page.getByRole('button', { name: 'Undo', exact: true }).click()
+  assert.equal(await ruleDraftName.inputValue(), 'AI', 'Undo restores selected saved ruleset')
+  const firstRule = page.locator('.unified-rule').first()
+  const expandRule = firstRule.getByRole('button', { name: 'OpenAI', exact: true })
+  const namedDestination = firstRule.getByRole('combobox', { name: 'Destination for OpenAI', exact: true })
+  assert.equal(await namedDestination.locator('option').nth(0).innerText(), 'Direct')
+  assert.equal(await namedDestination.locator('option').nth(1).innerText(), 'Block')
+  assert.ok(await namedDestination.locator('option[value="node:node_falemon_sg"]').count(), 'named rules list available local nodes')
+  assert.equal(await expandRule.getAttribute('aria-expanded'), 'false')
+  assert.equal(await firstRule.locator('.unified-rule-conditions').count(), 0, 'collapsed rule headers omit the condition summary')
+  await namedDestination.selectOption('direct')
+  assert.equal(await expandRule.getAttribute('aria-expanded'), 'false', 'changing a collapsed rule destination does not expand it')
+  assert.equal(await namedDestination.inputValue(), 'direct')
+  await namedDestination.selectOption('node:node_falemon_taipei')
+  assert.equal(await expandRule.getAttribute('aria-expanded'), 'false', 'proxy destination changes also keep the rule collapsed')
+  await namedDestination.selectOption('node:node_falemon_sg')
+  await expandRule.click()
+  assert.equal(await firstRule.locator('.unified-destination-field').count(), 1, 'expanded rules keep exactly one destination selector in the row')
+  await firstRule.getByRole('textbox', { name: 'Rule name', exact: true }).fill('OpenAI draft')
+  const catchallDestination = page.getByRole('combobox', { name: 'Everything else destination', exact: true })
+  assert.equal(await catchallDestination.locator('option').nth(0).innerText(), 'Direct')
+  assert.equal(await catchallDestination.locator('option').nth(1).innerText(), 'Block')
+  await catchallDestination.selectOption('node:node_falemon_taipei')
+  await firstRule.getByRole('button', { name: 'Add condition', exact: true }).click()
+  assert.equal(await firstRule.locator('.unified-condition').count(), 2, 'conditions edit inline on their owning rule')
+  assert.equal(await firstRule.getByLabel('Copy conditions').count(), 0, 'the expanded editor does not show a condition copy control')
+  await firstRule.getByRole('textbox', { name: 'Condition 2 value', exact: true }).fill('chatgpt.com')
+  assert.equal(await page.getByRole('button', { name: 'Import JSON', exact: true }).isVisible(), true)
+  assert.equal(await page.getByRole('button', { name: 'Export ruleset', exact: true }).isVisible(), true)
+  const [routingExport] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: 'Export ruleset', exact: true }).click(),
+  ])
+  const routingDoc = JSON.parse(await readFile(await routingExport.path(), 'utf8'))
+  assert.equal(routingDoc.format, 'clashfork-routing')
+  assert.equal(routingDoc.version, 1)
+  assert.equal(routingDoc.type, 'ruleset')
+  assert.equal(routingDoc.rules[0].conditions.length, 2)
+  assert.equal(routingDoc.rules[0].destination.kind, 'proxy')
+  assert.equal(routingDoc.miscellaneous.kind, 'proxy', 'catch-all proxy destinations export portably')
+  assert.notEqual(routingDoc.rules[0].destination.proxyRef, routingDoc.miscellaneous.proxyRef, 'distinct rule and fallback nodes export as distinct opaque references')
+  assert.equal(Object.hasOwn(routingDoc.miscellaneous, 'nodeId'), false, 'catch-all export must not include local node IDs')
+  assert.equal(Object.hasOwn(routingDoc.rules[0].destination, 'nodeId'), false, 'exports must not include local node IDs')
+  assert.equal(Object.hasOwn(routingDoc.rules[0].conditions[0], 'id'), false, 'exports must omit local condition IDs')
+  assert.equal(JSON.stringify(routingDoc).includes('node_falemon'), false, 'exports must not include internal routing IDs')
+  assert.equal(JSON.stringify(routingDoc).includes('serviceId'), false, 'exports must not include provider identifiers')
+  await page.getByRole('button', { name: 'Import JSON', exact: true }).click()
+  await page.locator('input[type=file]').setInputFiles({ name: 'unsupported.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({ format: 'clashfork-routing', version: 9, type: 'rule' })) })
+  await page.getByRole('alert').getByText('Unsupported routing file format or version.', { exact: true }).waitFor()
+  assert.equal(await ruleDraftName.inputValue(), 'AI', 'invalid import must not change the selected draft')
+  assert.equal(await page.getByRole('dialog').count(), 0, 'invalid input must not open an import preview')
+  await page.getByRole('button', { name: 'Import JSON', exact: true }).click()
+  await page.locator('input[type=file]').setInputFiles(await routingExport.path())
+  const routingImport = page.getByRole('dialog', { name: 'Import ruleset' })
+  await routingImport.waitFor()
+  await routingImport.getByText('Choose local nodes for the proxy destinations. Save the draft to apply it.', { exact: true }).waitFor()
+  const mappings = routingImport.getByLabel(/Map .* to local node/)
+  assert.equal(await mappings.count(), 2, 'each distinct rule or fallback proxy reference needs its own mapping')
+  assert.equal(await mappings.nth(0).inputValue(), '', 'proxy mappings must start unselected')
+  assert.equal(await mappings.nth(1).inputValue(), '', 'fallback proxy mapping must start unselected')
+  assert.equal(await mappings.nth(0).locator('option').first().innerText(), 'Choose a node')
+  assert.equal(await routingImport.getByRole('button', { name: 'Use imported draft', exact: true }).isDisabled(), true, 'proxy imports must require explicit local mapping')
+  await mappings.nth(0).selectOption('node_falemon_sg')
+  await mappings.nth(1).selectOption('node_falemon_taipei')
+  await routingImport.getByRole('button', { name: 'Use imported draft', exact: true }).click()
+  assert.equal(await page.getByRole('textbox', { name: 'Ruleset name', exact: true }).inputValue(), 'AI (imported)')
+  assert.equal(await page.getByRole('combobox', { name: 'Everything else destination', exact: true }).inputValue(), 'node:node_falemon_taipei', 'import maps fallback proxy to the explicit local node')
+  const rulesetPicker = page.getByRole('combobox', { name: 'Ruleset', exact: true })
+  await rulesetPicker.selectOption('ruleset_ai')
+  assert.equal(await page.locator('.unified-rule-name').first().innerText(), 'OpenAI draft', 'import must retain the existing unsaved ruleset edits')
+  assert.equal(await rulesetPicker.locator('option').filter({ hasText: 'AI (imported) · Draft' }).count(), 1, 'imported rulesets remain drafts until Save')
+  const [ruleExport] = await Promise.all([
+    page.waitForEvent('download'),
+    page.locator('.unified-rule').first().getByRole('button', { name: 'Export rule', exact: true }).click(),
+  ])
+  const ruleDoc = JSON.parse(await readFile(await ruleExport.path(), 'utf8'))
+  assert.equal(ruleDoc.type, 'rule')
+  assert.equal(ruleDoc.rule.name, 'OpenAI draft')
+  assert.equal(ruleDoc.rule.conditions.length, 2)
+  await page.getByRole('button', { name: 'Import JSON', exact: true }).click()
+  await page.locator('input[type=file]').setInputFiles(await ruleExport.path())
+  const ruleImport = page.getByRole('dialog', { name: 'Import rule' })
+  await ruleImport.waitFor()
+  await ruleImport.getByLabel(/Map .* to local node/).selectOption('node_falemon_sg')
+  await ruleImport.getByRole('button', { name: 'Use imported draft', exact: true }).click()
+  assert.equal(await page.locator('.unified-rule').count(), 3, 'single-rule import appends to the selected unsaved draft')
+  assert.equal(await rulesetPicker.inputValue(), 'ruleset_ai', 'single-rule import keeps the current ruleset draft selected')
   await capture('rulesets')
   await open('Live Connections')
   await waitForMockCalls('get_live', 1)
@@ -194,34 +324,72 @@ try {
     const bars = await page.locator('.bar-group').evaluateAll((items) => items.map((item) => ({
       download: Number(item.getAttribute('data-history-bar-download')),
       upload: Number(item.getAttribute('data-history-bar-upload')),
+      proxy: Number(item.getAttribute('data-history-bar-proxy')),
+      direct: Number(item.getAttribute('data-history-bar-direct')),
     })))
     assert.equal(rows.reduce((sum, item) => sum + item.download, 0), totals.download, 'history rows must match filtered download totals')
     assert.equal(rows.reduce((sum, item) => sum + item.upload, 0), totals.upload, 'history rows must match filtered upload totals')
     assert.equal(bars.reduce((sum, item) => sum + item.download, 0), totals.download, 'history bars must match filtered download totals')
     assert.equal(bars.reduce((sum, item) => sum + item.upload, 0), totals.upload, 'history bars must match filtered upload totals')
+    assert.ok(bars.every((item) => Number.isFinite(item.proxy) && Number.isFinite(item.direct) && item.proxy >= 0 && item.direct >= 0), 'chart lanes must use nonnegative measured route totals')
+    assert.ok(bars.reduce((sum, item) => sum + item.proxy + item.direct, 0) <= totals.download + totals.upload, 'route lanes must not exceed authoritative report totals')
+  }
+
+  const assertRouteLanes = async (filter) => {
+    const totals = await page.locator('.bar-group').evaluateAll((items) => items.reduce((sum, item) => ({
+      proxy: sum.proxy + Number(item.getAttribute('data-history-bar-proxy')),
+      direct: sum.direct + Number(item.getAttribute('data-history-bar-direct')),
+    }), { proxy: 0, direct: 0 }))
+    if (filter === 'proxy') {
+      assert.ok(totals.proxy > 0, 'Proxy filter should show measured Proxy traffic')
+      assert.equal(totals.direct, 0, 'Proxy filter must keep the right Direct lane empty')
+    } else if (filter === 'direct') {
+      assert.ok(totals.direct > 0, 'Direct filter should show measured Direct traffic')
+      assert.equal(totals.proxy, 0, 'Direct filter must keep the left Proxy lane empty')
+    }
   }
 
   await assertHistoryAccounting()
+  assert.deepEqual(
+    await page.locator('.bar-group').first().locator('.bar-route-slot').evaluateAll((items) => items.map((item) => item.getAttribute('data-history-route'))),
+    ['proxy', 'direct'],
+    'each period must keep Proxy on the left and Direct on the right',
+  )
+  const chartPairLayout = await page.locator('.bar-group').evaluateAll((groups) => groups.map((group) => {
+    const bounds = group.getBoundingClientRect()
+    const [proxy, direct] = [...group.querySelectorAll('.bar-route-slot')].map((item) => item.getBoundingClientRect())
+    return {
+      groupLeft: bounds.left,
+      groupRight: bounds.right,
+      groupCenter: (bounds.left + bounds.right) / 2,
+      proxyCenter: (proxy.left + proxy.right) / 2,
+      directCenter: (direct.left + direct.right) / 2,
+      pairGap: direct.left - proxy.right,
+    }
+  }))
+  assert.ok(chartPairLayout.every((period) => period.pairGap >= 0 && period.pairGap <= 3), 'each period must draw adjacent route bars with a small internal gap')
+  assert.ok(chartPairLayout.every((period) => Math.abs((period.proxyCenter + period.directCenter) / 2 - period.groupCenter) < 2), 'route pairs must be centered within their shared date group')
+  assert.ok(chartPairLayout.slice(1).every((period, index) => period.groupLeft - chartPairLayout[index].groupRight > 0), 'date groups must remain visually separated')
   await routeFilter.focus()
   await page.keyboard.press('Tab')
   await page.keyboard.press('Tab')
   assert.equal(await page.evaluate(() => document.activeElement?.classList.contains('bar-group')), true, 'chart periods must be keyboard reachable')
   const periodInspector = page.locator('.bar-period-inspector')
   let periodDetails = await periodInspector.innerText()
-  assert.match(periodDetails, /Download/)
-  assert.match(periodDetails, /Upload/)
+  assert.match(periodDetails, /Proxy/)
+  assert.match(periodDetails, /Direct/)
   assert.match(periodDetails, /No recording gap/)
   assert.ok(await periodInspector.locator('strong').innerText(), 'period details must include a date')
   await page.locator('.bar-group').first().hover()
-  assert.match(await page.locator('.bar-group').first().getAttribute('aria-label'), /Download .* Upload .* recording gap/i)
+  assert.match(await page.locator('.bar-group').first().getAttribute('aria-label'), /Proxy .* Direct .* recording gap/i)
   await page.getByRole('button', { name: '30 days', exact: true }).click()
   const gapPeriod = page.locator('.bar-group[data-history-bar-gap="true"]').first()
   await gapPeriod.waitFor()
   await gapPeriod.hover()
   await periodInspector.getByText('Recording gap', { exact: true }).waitFor()
   periodDetails = await periodInspector.innerText()
-  assert.match(periodDetails, /Download/)
-  assert.match(periodDetails, /Upload/)
+  assert.match(periodDetails, /Proxy/)
+  assert.match(periodDetails, /Direct/)
   assert.ok(await periodInspector.locator('strong').innerText(), 'gap details must include a date')
   await assertHistoryAccounting()
 
@@ -231,6 +399,7 @@ try {
     const classes = [...document.querySelectorAll('.history-table .route-class')]
     return classes.length > 0 && classes.every((item) => item.classList.contains('route-class-proxy'))
   })
+  await assertRouteLanes('proxy')
   assert.equal(await routeFilter.inputValue(), 'proxy', 'breakdown changes must preserve route filters')
   await assertHistoryAccounting()
   await subjectFilter.selectOption({ label: 'Development' })
@@ -248,6 +417,10 @@ try {
   await routeFilter.selectOption('direct')
   await page.getByRole('heading', { name: 'No traffic matches these filters', exact: true }).waitFor()
   assert.equal(await page.locator('.metric-panel').getAttribute('data-history-total'), '0')
+  const noMatchLanes = await page.locator('.bar-group').evaluateAll((items) => items.every((item) =>
+    Number(item.getAttribute('data-history-bar-proxy')) === 0 && Number(item.getAttribute('data-history-bar-direct')) === 0,
+  ))
+  assert.equal(noMatchLanes, true, 'no-match chart lanes must remain empty')
   assert.ok((await subjectFilter.locator('option').allTextContents()).includes('steam.exe'), 'app choices must remain available when filters match no traffic')
   await assertHistoryAccounting()
   await capture('history-no-match')
@@ -255,6 +428,7 @@ try {
   await subjectFilter.selectOption({ label: 'AI tools' })
   await page.locator('.history-table').getByText('AI tools', { exact: true }).waitFor()
   await page.locator('.history-table .route-class-direct').first().waitFor()
+  await assertRouteLanes('direct')
   await capture('history-filtered')
   await page.getByLabel('Breakdown').selectOption('app')
   await page.locator('.history-table').getByText('ChatGPT.exe', { exact: true }).waitFor()
@@ -305,6 +479,81 @@ try {
   await waitForMockCalls('get_diagnostics', diagnosticCalls + 1)
   assertNewestFirst(await diagnosticOrder())
   await capture('diagnostics')
+
+  const refreshPage = await browser.newPage({ viewport: { width: 1280, height: 800 }, reducedMotion: 'reduce' })
+  const softRefreshUrl = new URL(url.href)
+  softRefreshUrl.searchParams.set('fixture', 'refresh-soft-failure')
+  await refreshPage.goto(softRefreshUrl.href, { waitUntil: 'domcontentloaded' })
+  await refreshPage.getByRole('navigation').getByRole('button', { name: 'Nodes', exact: true }).click()
+  const falemonCard = refreshPage.locator('.service-card').first()
+  await falemonCard.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await refreshPage.waitForFunction(() => (window.__clashforkMockCalls?.refresh_service ?? 0) === 1)
+  await refreshPage.getByText('Singapore I0', { exact: true }).first().waitFor()
+  assert.equal(await refreshPage.locator('.service-error').count(), 0, 'transient refresh failure must preserve usable nodes without an alarming error')
+  if (screenshotDirectory) {
+    await refreshPage.screenshot({ path: join(screenshotDirectory, 'refresh-soft-failure.png'), fullPage: true })
+  }
+
+  const missingPage = await browser.newPage({ viewport: { width: 1280, height: 800 }, reducedMotion: 'reduce' })
+  const missingUrl = new URL(url.href)
+  missingUrl.searchParams.set('fixture', 'actionable-missing')
+  await missingPage.goto(missingUrl.href, { waitUntil: 'domcontentloaded' })
+  await missingPage.getByRole('navigation').getByRole('button', { name: 'Nodes', exact: true }).click()
+  await missingPage.getByText('Missing · choose replacement', { exact: true }).waitFor()
+  assert.match(await missingPage.locator('.service-error').first().innerText(), /disappeared|replacement/i, 'confirmed missing selection must retain an actionable warning')
+  await missingPage.getByRole('navigation').getByRole('button', { name: 'Rulesets', exact: true }).click()
+  const missingRule = missingPage.locator('.unified-rule').first()
+  const missingDestination = missingRule.getByRole('combobox', { name: 'Destination for OpenAI', exact: true })
+  assert.equal(await missingRule.locator('.unified-rule-expand').getAttribute('aria-expanded'), 'false')
+  assert.equal(await missingDestination.inputValue(), 'node:node_falemon_sg', 'a selected missing node remains selected while the rule is collapsed')
+  assert.equal(await missingDestination.locator('option:disabled').filter({ hasText: 'Missing' }).count(), 1, 'a selected missing node remains available as a disabled reference')
+  assert.equal(await missingRule.locator('.selected-node-latency').count(), 0, 'a selected node without a measurement must not reserve an empty latency line')
+  if (screenshotDirectory) {
+    await missingPage.screenshot({ path: join(screenshotDirectory, 'nodes-actionable-missing.png'), fullPage: true })
+  }
+  await refreshPage.close()
+  await missingPage.close()
+
+  const staleLatencyPage = await browser.newPage({ viewport: { width: 1280, height: 800 }, reducedMotion: 'reduce' })
+  const staleLatencyUrl = new URL(url.href)
+  staleLatencyUrl.searchParams.set('fixture', 'latency-stale')
+  await staleLatencyPage.goto(staleLatencyUrl.href, { waitUntil: 'domcontentloaded' })
+  await staleLatencyPage.getByRole('navigation').getByRole('button', { name: 'Nodes', exact: true }).click()
+  const staleRow = staleLatencyPage.locator('[data-node-id="node_falemon_sg"]')
+  await staleRow.locator('del[data-latency-ms="142"]').waitFor()
+  assert.equal(await staleRow.locator('del[data-latency-ms="142"]').innerText(), '142 ms', 'latency becomes struck through at the 15 minute threshold')
+  await staleLatencyPage.getByRole('navigation').getByRole('button', { name: 'Dashboard', exact: true }).click()
+  await staleLatencyPage.getByRole('button', { name: 'Global', exact: true }).click()
+  await staleLatencyPage.locator('.picker-field .selected-node-latency del[data-latency-ms="142"]').waitFor()
+  if (screenshotDirectory) await staleLatencyPage.screenshot({ path: join(screenshotDirectory, 'stale-latency-picker.png'), fullPage: true })
+
+  const globalModalPage = await browser.newPage({ viewport: { width: 1280, height: 800 }, reducedMotion: 'reduce' })
+  const globalModalUrl = new URL(url.href)
+  globalModalUrl.searchParams.set('fixture', 'global-unselected')
+  await globalModalPage.goto(globalModalUrl.href, { waitUntil: 'domcontentloaded' })
+  await globalModalPage.getByRole('button', { name: 'Global', exact: true }).click()
+  const globalDialog = globalModalPage.getByRole('dialog', { name: 'Choose a Global node' })
+  await globalDialog.waitFor()
+  await globalDialog.getByRole('combobox', { name: 'Node', exact: true }).selectOption('node_falemon_sg')
+  assert.equal(await globalDialog.locator('.selected-node-latency').count(), 0, 'an untested Global node must not leave an empty latency line in the dialog')
+
+  const latencyFailurePage = await browser.newPage({ viewport: { width: 1280, height: 800 }, reducedMotion: 'reduce' })
+  const latencyFailureUrl = new URL(url.href)
+  latencyFailureUrl.searchParams.set('fixture', 'latency-failure')
+  await latencyFailurePage.goto(latencyFailureUrl.href, { waitUntil: 'domcontentloaded' })
+  await latencyFailurePage.getByRole('switch', { name: 'VPN connection' }).click()
+  await latencyFailurePage.getByRole('heading', { name: 'Connected', exact: true }).waitFor()
+  await latencyFailurePage.getByRole('navigation').getByRole('button', { name: 'Nodes', exact: true }).click()
+  const failedNodeRow = latencyFailurePage.locator('[data-node-id="node_falemon_sg"]')
+  await failedNodeRow.getByRole('button', { name: 'Test Singapore I0 latency', exact: true }).click()
+  await failedNodeRow.getByText('No response', { exact: true }).waitFor()
+  assert.equal(await failedNodeRow.locator('.latency-value[data-latency-ms="0"]').count(), 0, 'failed test must not be rendered as zero latency')
+  await latencyFailurePage.getByRole('button', { name: 'Test all nodes', exact: true }).click()
+  await latencyFailurePage.getByText('4 of 5 responded', { exact: true }).waitFor()
+  await latencyFailurePage.locator('[data-node-id="node_northwind_osaka"]').getByText('No response', { exact: true }).waitFor()
+  await staleLatencyPage.close()
+  await globalModalPage.close()
+  await latencyFailurePage.close()
 
   const viewports = [
     { name: '800x640', width: 800, height: 640 },
@@ -382,13 +631,33 @@ try {
       }
 
       if (screen === 'Rulesets') {
-        const editor = page.locator('.ruleset-detail')
-        await editor.waitFor()
-        assert.ok(await page.getByRole('button', { name: 'New ruleset', exact: true }).isVisible(), `Ruleset header actions must remain visible at ${viewport.name}`)
-        const editorRect = await editor.boundingBox()
-        assert.ok(editorRect.width > 260, `Ruleset details must retain usable width at ${viewport.name}`)
+        const panel = page.locator('.unified-rules-panel')
+        await panel.waitFor()
+        const newRuleset = page.getByRole('button', { name: 'New ruleset', exact: true })
+        assert.ok(await newRuleset.isVisible(), `New ruleset must remain available at ${viewport.name}`)
+        const headerLayout = await page.evaluate(() => {
+          const title = document.querySelector('.rulesets-page > .page-header h1').getBoundingClientRect()
+          const action = document.querySelector('.rulesets-page > .page-header .page-actions').getBoundingClientRect()
+          return { titleTop: title.top, titleBottom: title.bottom, actionTop: action.top, actionBottom: action.bottom, actionRight: action.right }
+        })
+        assert.ok(Math.abs(headerLayout.titleTop - headerLayout.actionTop) <= 8, `Rulesets title and action should share a row at ${viewport.name}`)
+        assert.ok(headerLayout.actionRight <= viewport.width, `Rulesets header action must fit at ${viewport.name}`)
+        assert.equal(await page.getByText('Final catch-all · always last', { exact: true }).count(), 0, `catch-all helper text must stay removed at ${viewport.name}`)
+        assert.equal(await page.getByText('First matching rule wins · OR within a rule', { exact: true }).count(), 0, `duplicate matching helper text must stay removed at ${viewport.name}`)
+        assert.equal(await page.getByLabel('Copy conditions').count(), 0, `condition copy picker must stay removed at ${viewport.name}`)
+        assert.equal(await page.locator('.unified-rule-conditions').count(), 0, `named rule headers must not show condition summaries at ${viewport.name}`)
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `Rulesets must not overflow at ${viewport.name}`)
+        const metrics = await page.evaluate(() => {
+          const panel = document.querySelector('.unified-rules-panel').getBoundingClientRect()
+          const row = document.querySelector('.unified-rule-summary')?.getBoundingClientRect()
+          return { panelRight: panel.right, rowRight: row?.right ?? panel.right, rowHeight: row?.height ?? 0 }
+        })
+        assert.ok(metrics.rowHeight === 0 || metrics.rowHeight <= 60, `Collapsed rules must stay compact at ${viewport.name}: ${JSON.stringify(metrics)}`)
+        assert.ok(metrics.rowRight <= metrics.panelRight, `Rules must stay inside the panel at ${viewport.name}`)
+        if (screenshotDirectory && ['800x640', '1920x1000'].includes(viewport.name)) {
+          await page.screenshot({ path: join(screenshotDirectory, `rulesets-${viewport.name}.png`), fullPage: true })
+        }
       }
-
       if (screen === 'Logs') {
         assert.ok(await page.getByLabel('Route', { exact: true }).isVisible(), `History route filter must remain visible at ${viewport.name}`)
         assert.ok(await page.getByLabel('App or group', { exact: true }).isVisible(), `History app filter must remain visible at ${viewport.name}`)
@@ -473,39 +742,65 @@ try {
   await freshPage.getByRole('heading', { name: 'Dashboard', exact: true }).waitFor()
   await freshPage.getByRole('navigation').getByRole('button', { name: 'Rulesets', exact: true }).click()
   await freshPage.getByRole('heading', { name: 'Rulesets', exact: true }).waitFor()
-  assert.equal(await freshPage.getByText('No rulesets yet.', { exact: true }).count(), 1)
+  assert.equal(await freshPage.getByRole('combobox', { name: 'Ruleset', exact: true }).locator('option').filter({ hasText: 'No rulesets yet' }).count(), 1)
   await freshPage.getByRole('button', { name: 'New ruleset', exact: true }).first().click()
   const rulesetName = freshPage.getByRole('textbox', { name: 'Ruleset name', exact: true })
   await rulesetName.fill('Fresh')
-  const miscellaneous = freshPage.getByRole('combobox', { name: 'Miscellaneous action', exact: true })
-  assert.equal(await miscellaneous.inputValue(), 'direct', 'fresh rulesets default Miscellaneous to Direct')
+  const miscellaneous = freshPage.getByRole('combobox', { name: 'Everything else destination', exact: true })
+  assert.equal(await miscellaneous.inputValue(), 'direct')
   await miscellaneous.selectOption('block')
-  await freshPage.getByRole('button', { name: 'Save ruleset', exact: true }).click()
-  await freshPage.locator('.ruleset-index').getByRole('button', { name: /Fresh/ }).waitFor()
-  assert.equal(await miscellaneous.inputValue(), 'block')
+  await miscellaneous.selectOption('node:node_falemon_sg')
+  assert.equal(await miscellaneous.inputValue(), 'node:node_falemon_sg', 'fallback selector offers actual local nodes')
+  await freshPage.getByRole('button', { name: 'Add rule', exact: true }).click()
+  await freshPage.getByRole('textbox', { name: 'Rule name', exact: true }).fill('Fresh rule')
+  await freshPage.getByRole('textbox', { name: 'Condition 1 value', exact: true }).fill('fresh.example')
+  await freshPage.getByRole('button', { name: 'Save', exact: true }).click()
+  await freshPage.waitForFunction(() => [...document.querySelectorAll('.unified-rules-select select option')].some(option => option.textContent?.startsWith('Fresh')))
+  const rulesetSelector = freshPage.getByRole('combobox', { name: 'Ruleset', exact: true })
+  const freshRulesetValue = await rulesetSelector.locator('option').filter({ hasText: 'Fresh' }).getAttribute('value')
+  assert.ok(freshRulesetValue)
+  await freshPage.getByRole('button', { name: 'Undo', exact: true }).click()
+  assert.equal(await rulesetName.inputValue(), 'Fresh')
+  await freshPage.getByRole('button', { name: 'Import JSON', exact: true }).click()
+  await freshPage.locator('input[type=file]').setInputFiles({ name: 'rule.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({format:'clashfork-routing',version:1,type:'rule',rule:{name:'Imported',conditions:[{kind:'domain_suffix',value:'import.test'}],destination:{kind:'direct'}}})) })
+  const importDialog = freshPage.getByRole('dialog', { name: 'Import rule' })
+  await importDialog.waitFor()
+  await importDialog.getByRole('button', { name: 'Cancel import', exact: true }).click()
+  assert.equal(await rulesetName.inputValue(), 'Fresh', 'cancel keeps current draft unchanged')
+  await freshPage.getByRole('button', { name: 'Import JSON', exact: true }).click()
+  await freshPage.locator('input[type=file]').setInputFiles({ name: 'legacy-actions.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({format:'clashfork-routing',version:1,type:'ruleset',name:'Legacy actions',miscellaneous:'block',rules:[{name:'Direct rule',conditions:[{kind:'domain_suffix',value:'legacy.example'}],destination:{kind:'direct'}}]})) })
+  const legacyImport = freshPage.getByRole('dialog', { name: 'Import ruleset' })
+  await legacyImport.waitFor()
+  await legacyImport.getByText('Save the draft to apply it.', { exact: true }).waitFor()
+  assert.equal(await legacyImport.getByText(/Choose local nodes for the proxy destinations/).count(), 0, 'imports without proxies omit mapping instructions')
+  assert.equal(await legacyImport.getByRole('button', { name: 'Use imported draft', exact: true }).isDisabled(), false, 'legacy Direct and Block routing documents remain importable without a proxy map')
+  await legacyImport.getByRole('button', { name: 'Use imported draft', exact: true }).click()
+  assert.equal(await freshPage.getByRole('combobox', { name: 'Everything else destination', exact: true }).inputValue(), 'block', 'legacy catch-all action remains unchanged')
   await freshPage.getByRole('navigation').getByRole('button', { name: 'Dashboard', exact: true }).click()
   await freshPage.getByRole('heading', { name: 'Dashboard', exact: true }).waitFor()
-  const freshSelector = freshPage.getByRole('combobox', { name: 'Ruleset', exact: true })
-  await freshSelector.selectOption({ label: 'Fresh' })
-  await freshPage.getByText('Rule · Fresh', { exact: true }).first().waitFor()
-
+  await freshPage.waitForFunction(() => [...document.querySelectorAll('.picker-field select[aria-label="Ruleset"] option')].some(option => option.textContent === 'Fresh'))
   await freshPage.getByRole('navigation').getByRole('button', { name: 'Rulesets', exact: true }).click()
-  await freshPage.getByRole('heading', { name: 'Rulesets', exact: true }).waitFor()
   await freshPage.getByRole('button', { name: 'New ruleset', exact: true }).first().click()
-  await freshPage.getByRole('button', { name: 'Save ruleset', exact: true }).click()
+  await freshPage.getByRole('button', { name: 'Save', exact: true }).click()
   await freshPage.getByRole('alert').getByText('Name the ruleset before saving.', { exact: true }).waitFor()
-  assert.equal(await freshPage.getByRole('textbox', { name: 'Ruleset name', exact: true }).inputValue(), '')
-  await freshPage.getByRole('textbox', { name: 'Ruleset name', exact: true }).fill('Fresh')
-  await freshPage.getByRole('button', { name: 'Save ruleset', exact: true }).click()
-  await freshPage.getByRole('alert').getByText('A ruleset with this name already exists.', { exact: true }).waitFor()
-  assert.equal(await freshPage.getByRole('textbox', { name: 'Ruleset name', exact: true }).inputValue(), 'Fresh')
   assert.deepEqual(freshErrors, [])
   assert.deepEqual(freshConsoleIssues, [])
   if (screenshotDirectory) {
     await freshPage.waitForTimeout(300)
     await freshPage.screenshot({ path: join(screenshotDirectory, 'ruleset-errors.png'), fullPage: true })
   }
-  console.log('Fresh ruleset fixture passed: empty setup, Direct default, Block save, Dashboard selection, duplicate/empty validation with draft retention.')
+  console.log('Fresh ruleset fixture passed: empty setup, Direct default, Block and node fallback selection, Dashboard selection, duplicate/empty validation with draft retention.')
+
+  const advisoryPage = await browser.newPage({ viewport: { width: 1280, height: 800 }, reducedMotion: 'reduce' })
+  advisoryPage.setDefaultTimeout(25000)
+  const advisoryUrl = new URL(url.href)
+  advisoryUrl.searchParams.set('fixture', 'competing-tunnel')
+  await advisoryPage.goto(advisoryUrl.href, { waitUntil: 'domcontentloaded' })
+  await advisoryPage.getByRole('heading', { name: 'Dashboard', exact: true }).waitFor()
+  await advisoryPage.getByRole('status').filter({ hasText: 'Another active tunnel adapter currently owns the selected outbound route' }).waitFor()
+  assert.equal(await advisoryPage.getByRole('status').filter({ hasText: 'Clashfork has not changed system routing' }).count(), 1)
+  if (screenshotDirectory) await advisoryPage.screenshot({ path: join(screenshotDirectory, 'tunnel-advisory.png'), fullPage: true })
+  console.log('Tunnel-conflict advisory fixture passed: actionable warning is visible and explicitly read-only.')
   if (screenshotDirectory) console.log(screenshotDirectory)
 } finally {
   await browser.close()

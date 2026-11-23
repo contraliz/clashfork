@@ -1,10 +1,12 @@
 import { useMemo, useState } from 'react'
 import { api } from '../api'
-import { useLiveRates, useRatePoints } from '../hooks'
+import { useLiveRates, useNowMs, useRatePoints } from '../hooks'
+import { SelectedNodeLatency } from '../components/NodeLatency'
 import { formatBytes, formatRate } from '../lib/format'
 import type { Mode, Snapshot } from '../types'
 import {
   Button,
+  Banner,
   Field,
   Grid,
   GridItem,
@@ -24,6 +26,8 @@ interface Props {
 
 export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
   const { state, runtime } = snapshot
+  const now = useNowMs(1000)
+  const selectedGlobalNode = state.nodes.find((node) => node.id === state.selection.globalNodeId)
   const live = useLiveRates(true)
   const points = useRatePoints(live)
   const [busy, setBusy] = useState<string | null>(null)
@@ -31,6 +35,7 @@ export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
   const [presetName, setPresetName] = useState('')
   const [pendingMode, setPendingMode] = useState<Mode | null>(null)
   const [pendingDestination, setPendingDestination] = useState('')
+  const pendingGlobalNode = state.nodes.find((node) => node.id === pendingDestination)
   const missingSelection = useMemo(() => {
     if (state.selection.mode === 'rule') {
       return state.rulesets.length === 0
@@ -133,6 +138,17 @@ export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
     <div className="dashboard-page">
       <PageHeader title="Dashboard" />
 
+      {runtime.competingTunnel ? (
+        <Banner tone="warning">
+          Another active tunnel adapter currently owns the selected outbound route. Pause it before connecting Clashfork. Clashfork has not changed system routing.
+        </Banner>
+      ) : null}
+      {runtime.pendingReconnectServices.length > 0 ? (
+        <Banner tone="warning">
+          A selected node was updated by subscription refresh. The connected session keeps its current endpoint until you reconnect.
+        </Banner>
+      ) : null}
+
       <Grid className="dashboard-grid">
         <GridItem span={12}>
           <Panel className="vpn-panel" aria-labelledby="vpn-heading">
@@ -194,6 +210,9 @@ export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
                     disabled={busy !== null || state.nodes.length === 0}
                     onChange={(event) => changeSelection({ globalNodeId: event.target.value || null })}
                   >
+                    {selectedGlobalNode?.missing ? (
+                      <option value={selectedGlobalNode.id} disabled>{selectedGlobalNode.displayName} · Missing</option>
+                    ) : null}
                     <option value="">Select a node</option>
                     {groupNodesByService(state.nodes).map(([serviceId, nodes]) => (
                       <optgroup key={serviceId} label={nodes[0].serviceTitle}>
@@ -205,6 +224,7 @@ export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
                       </optgroup>
                     ))}
                   </select>
+                  <SelectedNodeLatency node={selectedGlobalNode} now={now} />
                 </Field>
               )}
             </div>
@@ -222,26 +242,26 @@ export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
           <Panel className="traffic-panel" aria-labelledby="traffic-heading">
             <PanelHeading
               id="traffic-heading"
-              title="Live traffic"
+              title="Proxy traffic"
               actions={
-                <div className="chart-legend">
-                  <span><i className="legend-download" /> Download</span>
-                  <span><i className="legend-upload" /> Upload</span>
+              <div className="chart-legend">
+                  <span><i className="legend-download" /> Proxy download</span>
+                  <span><i className="legend-upload" /> Proxy upload</span>
                 </div>
               }
             />
             <div className="rate-row">
               <div className="rate-block">
-                <span className="rate-label"><span className="rate-mark rate-mark-download" aria-hidden="true" />Download</span>
-                <strong>{runtime.vpnActive ? formatRate(live.downloadRate) : '— B/s'}</strong>
+                <span className="rate-label"><span className="rate-mark rate-mark-download" aria-hidden="true" />Proxy download</span>
+                <strong>{runtime.vpnActive && live.available ? formatRate(live.proxyDownloadRate) : '— B/s'}</strong>
               </div>
               <div className="rate-divider" />
               <div className="rate-block">
-                <span className="rate-label"><span className="rate-mark rate-mark-upload" aria-hidden="true" />Upload</span>
-                <strong className="is-upload">{runtime.vpnActive ? formatRate(live.uploadRate) : '— B/s'}</strong>
+                <span className="rate-label"><span className="rate-mark rate-mark-upload" aria-hidden="true" />Proxy upload</span>
+                <strong className="is-upload">{runtime.vpnActive && live.available ? formatRate(live.proxyUploadRate) : '— B/s'}</strong>
               </div>
             </div>
-            <div className="traffic-chart" role="img" aria-label="Recent download and upload rates">
+            <div className="traffic-chart" role="img" aria-label="Recent proxy download and upload rates">
               <div className="chart-y-labels" aria-hidden="true">
                 {chart.labels.map((label, index) => <span key={index}>{label}</span>)}
               </div>
@@ -366,6 +386,7 @@ export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
                   ))}
             </select>
           </Field>
+          {pendingMode === 'global' ? <SelectedNodeLatency node={pendingGlobalNode} now={now} /> : null}
           {pendingMode === 'rule' && state.rulesets.length === 0 ? (
             <p className="field-hint">Create a ruleset on the Rulesets page.</p>
           ) : null}

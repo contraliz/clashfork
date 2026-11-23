@@ -1,8 +1,8 @@
 use crate::{
     models::{
         AddNodesInput, AppState, CustomAppGroup, DiagnosticEntry, HistoryInput, HistoryReport,
-        ImportPreview, LiveRates, LiveSnapshot, SaveMatchGroupInput, SaveRulesetInput, Selection,
-        Snapshot,
+        ImportPreview, LiveRates, LiveSnapshot, NodeTestSummary, SaveMatchGroupInput,
+        SaveRulesetInput, Selection, Snapshot,
     },
     runtime::AppRuntime,
 };
@@ -65,6 +65,21 @@ pub async fn refresh_service(runtime: Runtime<'_>, service_id: String) -> Result
         .refresh_service(&service_id)
         .await
         .map_err(command_error)
+}
+
+#[tauri::command]
+pub async fn test_node(runtime: Runtime<'_>, node_id: String) -> Result<Snapshot, String> {
+    runtime.test_node(&node_id).await.map_err(command_error)
+}
+
+#[tauri::command]
+pub async fn test_all_nodes(runtime: Runtime<'_>) -> Result<NodeTestSummary, String> {
+    runtime.test_all_nodes().await.map_err(command_error)
+}
+
+#[tauri::command]
+pub fn cancel_node_test_sweep(runtime: Runtime<'_>) {
+    runtime.cancel_node_test_sweep();
 }
 
 #[tauri::command]

@@ -25,6 +25,7 @@ pub const CORE_MISSING: &str =
 pub struct ServiceProbe {
     pub available: bool,
     pub message: Option<String>,
+    pub protocol_info: Option<ProtocolInfo>,
 }
 
 pub async fn probe() -> ServiceProbe {
@@ -32,6 +33,7 @@ pub async fn probe() -> ServiceProbe {
         return ServiceProbe {
             available: false,
             message: Some(SERVICE_UNAVAILABLE.to_owned()),
+            protocol_info: None,
         };
     }
     match clashfork_service_ipc::get_version().await {
@@ -46,29 +48,22 @@ pub async fn probe() -> ServiceProbe {
                 ServiceProbe {
                     available: true,
                     message: None,
+                    protocol_info: response.data,
                 }
             } else {
                 ServiceProbe {
                     available: false,
                     message: Some(SERVICE_NEEDS_REPAIR.to_owned()),
+                    protocol_info: None,
                 }
             }
         }
         _ => ServiceProbe {
             available: false,
             message: Some(SERVICE_UNAVAILABLE.to_owned()),
+            protocol_info: None,
         },
     }
-}
-
-pub async fn protocol_info() -> Result<ProtocolInfo> {
-    let response = clashfork_service_ipc::get_version()
-        .await
-        .context(SERVICE_UNAVAILABLE)?;
-    if response.code != 0 {
-        bail!(SERVICE_NEEDS_REPAIR);
-    }
-    response.data.context(SERVICE_NEEDS_REPAIR)
 }
 
 pub async fn already_owned_session(
@@ -76,12 +71,14 @@ pub async fn already_owned_session(
     secrets: &mut SecretStore,
 ) -> Result<Option<String>> {
     let credentials = security::current_owner_credentials(&paths.data_root)?;
-    let response = match clashfork_service_ipc::get_status(&credentials).await {
-        Ok(response) => response,
-        Err(_) => return Ok(None),
-    };
+    let response = clashfork_service_ipc::get_status(&credentials)
+        .await
+        .context("the previous service session could not be inspected")?;
+    if response.code != 0 {
+        bail!(safe_service_message(response.code, &response.message));
+    }
     let Some(status) = response.data else {
-        return Ok(None);
+        bail!("the service did not return previous-session status");
     };
     if !status.is_active {
         secrets.last_session = None;
@@ -93,10 +90,13 @@ pub async fn already_owned_session(
                 .to_owned(),
         ));
     };
-    let proof = OwnerSessionProof {
-        generation: stored.generation,
-        token: stored.token,
+    let Some(proof) = proof_for_active_session(status.active_generation, &stored.token) else {
+        return Ok(Some(
+            "A previous Clashfork VPN session is active, but its generation could not be confirmed. Reinstall Clashfork Service to clear it safely."
+                .to_owned(),
+        ));
     };
+    secrets.last_session = Some(stored_session(&proof.token, proof.generation));
     match clashfork_service_ipc::stop_clash(&credentials, &proof).await {
         Ok(response) if response.code == 0 => {
             secrets.last_session = None;
@@ -110,15 +110,22 @@ pub async fn already_owned_session(
     }
 }
 
+fn proof_for_active_session(generation: Option<u64>, token: &str) -> Option<OwnerSessionProof> {
+    Some(OwnerSessionProof {
+        generation: generation?,
+        token: token.to_owned(),
+    })
+}
+
 pub async fn start(
     paths: &AppPaths,
     yaml: String,
     controller: &ControllerConfig,
     session_token: String,
+    info: ProtocolInfo,
 ) -> Result<(StartClashResult, OwnerSessionProof, String)> {
     let core_path = verify_installed_core(paths).await?;
     let credentials = security::current_owner_credentials(&paths.data_root)?;
-    let info = protocol_info().await?;
     if !info.supports_client(
         clashfork_service_ipc::ProtocolVersion::current(),
         clashfork_service_ipc::MIN_REQUIRED_SERVICE_REVISION,
@@ -295,19 +302,155 @@ fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
-pub async fn wait_ready(controller: &crate::controller::CoreController) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+const CONTROLLER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROLLER_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub async fn wait_ready_mode(
+    controller: &crate::controller::CoreController,
+    expected_mode: &str,
+) -> Result<()> {
+    wait_ready_config_with_timeout(controller, expected_mode, None, CONTROLLER_READY_TIMEOUT)
+        .await
+        .map(|_| ())
+}
+
+pub async fn wait_ready_config(
+    controller: &crate::controller::CoreController,
+    expected_mode: &str,
+    expected_tun: bool,
+) -> Result<crate::controller::ConfigStatus> {
+    wait_ready_config_with_timeout(
+        controller,
+        expected_mode,
+        Some(expected_tun),
+        CONTROLLER_READY_TIMEOUT,
+    )
+    .await
+}
+
+async fn wait_ready_config_with_timeout(
+    controller: &crate::controller::CoreController,
+    expected_mode: &str,
+    expected_tun: Option<bool>,
+    timeout: Duration,
+) -> Result<crate::controller::ConfigStatus> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if controller.version().await.is_ok() {
-            return Ok(());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(readiness_error(expected_mode, expected_tun));
         }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("The Mihomo core did not become ready. The TUN session was cleaned up.");
+        let request_timeout = remaining.min(CONTROLLER_READY_REQUEST_TIMEOUT);
+        if let Ok(Ok(status)) =
+            tokio::time::timeout(request_timeout, controller.config_status()).await
+            && status.mode.eq_ignore_ascii_case(expected_mode)
+            && expected_tun.is_none_or(|expected| status.tun_enabled == Some(expected))
+        {
+            return Ok(status);
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(readiness_error(expected_mode, expected_tun));
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(150))).await;
+    }
+}
+
+fn readiness_error(expected_mode: &str, expected_tun: Option<bool>) -> String {
+    match expected_tun {
+        Some(true) => format!(
+            "Mihomo did not report the selected {expected_mode} mode with TUN enabled. The VPN session was cleaned up."
+        ),
+        Some(false) => {
+            "Mihomo did not confirm TUN disabled in its selected mode. The VPN session was cleaned up."
+                .to_owned()
+        }
+        None => "Mihomo did not become ready in the selected mode. The TUN session was cleaned up."
+            .to_owned(),
     }
 }
 
 pub fn open_credentials(paths: &AppPaths) -> Result<OwnerCredentials> {
     security::current_owner_credentials(&paths.data_root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn pending_session_token_recovers_the_service_generation_after_a_lost_start_reply() {
+        let proof = proof_for_active_session(Some(42), "fixture-session-token").unwrap();
+        assert_eq!(proof.generation, 42);
+        assert_eq!(proof.token, "fixture-session-token");
+        assert!(proof_for_active_session(None, "fixture-session-token").is_none());
+    }
+
+    async fn respond_mode(stream: &mut tokio::net::TcpStream, mode: &str) {
+        let mut request = [0u8; 1024];
+        let length = stream.read(&mut request).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&request[..length]).starts_with("GET /configs HTTP/1.1"),
+            "readiness should use the config endpoint that reports mode"
+        );
+        let body = format!(r#"{{"mode":"{mode}","tun":{{"enable":false}}}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_selected_mode_using_controller_config_endpoint() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for mode in ["rule", "global"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                respond_mode(&mut stream, mode).await;
+            }
+        });
+        let controller = crate::controller::CoreController::new(
+            port,
+            "fixture-token".to_owned(),
+            reqwest::Client::new(),
+        );
+
+        wait_ready_config_with_timeout(&controller, "global", Some(false), Duration::from_secs(2))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_http_request_obeys_overall_deadline() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let controller = crate::controller::CoreController::new(
+            port,
+            "fixture-token".to_owned(),
+            reqwest::Client::new(),
+        );
+
+        let result = wait_ready_config_with_timeout(
+            &controller,
+            "rule",
+            Some(true),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(result.is_err());
+        server.abort();
+    }
 }

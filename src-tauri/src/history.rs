@@ -195,9 +195,10 @@ impl HistoryStore {
         let mut totals_down = 0u64;
         let mut totals_up = 0u64;
         let mut gaps = 0u64;
-        let mut buckets: BTreeMap<i64, (u64, u64, bool)> = BTreeMap::new();
+        let mut totals_by_minute = BTreeMap::new();
+        let mut buckets: BTreeMap<i64, (u64, u64, u64, u64, bool)> = BTreeMap::new();
         for start in bar_bucket_starts(from, to, bar_mode) {
-            buckets.insert(start, (0, 0, false));
+            buckets.insert(start, (0, 0, 0, 0, false));
         }
         for row in rows {
             let (minute, down, up, gap) = row?;
@@ -205,24 +206,81 @@ impl HistoryStore {
             let up = u64::try_from(up.max(0)).unwrap_or(0);
             totals_down = totals_down.saturating_add(down);
             totals_up = totals_up.saturating_add(up);
+            totals_by_minute.insert(minute, (down, up));
             if gap != 0 {
                 gaps = gaps.saturating_add(1);
             }
             let bucket = bar_bucket_start(minute, bar_mode);
-            let entry = buckets.entry(bucket).or_insert((0, 0, false));
+            let entry = buckets.entry(bucket).or_insert((0, 0, 0, 0, false));
             entry.0 = entry.0.saturating_add(down);
             entry.1 = entry.1.saturating_add(up);
-            entry.2 |= gap != 0;
+            entry.4 |= gap != 0;
+        }
+
+        let mut route_stmt = self.conn.prepare(
+            "SELECT minute, route_class, sum(download), sum(upload) FROM minute_apps
+             WHERE minute >= ?1 AND minute <= ?2 AND route_class IN ('proxy', 'direct')
+             GROUP BY minute, route_class ORDER BY minute, route_class",
+        )?;
+        let route_rows = route_stmt.query_map(params![from, to], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut routes_by_minute: BTreeMap<i64, (u64, u64, u64, u64)> = BTreeMap::new();
+        for row in route_rows {
+            let (minute, route_class, download, upload) = row?;
+            let routes = routes_by_minute.entry(minute).or_default();
+            match route_class.as_str() {
+                "proxy" => {
+                    routes.0 = u64::try_from(download.max(0)).unwrap_or(0);
+                    routes.1 = u64::try_from(upload.max(0)).unwrap_or(0);
+                }
+                "direct" => {
+                    routes.2 = u64::try_from(download.max(0)).unwrap_or(0);
+                    routes.3 = u64::try_from(upload.max(0)).unwrap_or(0);
+                }
+                _ => {}
+            }
+        }
+        for (minute, (mut proxy_down, mut proxy_up, mut direct_down, mut direct_up)) in
+            routes_by_minute
+        {
+            let (limit_down, limit_up) = totals_by_minute.get(&minute).copied().unwrap_or_default();
+            let estimated_down = proxy_down as u128 + direct_down as u128;
+            let estimated_up = proxy_up as u128 + direct_up as u128;
+            if estimated_down > limit_down as u128 {
+                proxy_down = scale_to_total(proxy_down, limit_down, estimated_down);
+                direct_down = scale_to_total(direct_down, limit_down, estimated_down);
+            }
+            if estimated_up > limit_up as u128 {
+                proxy_up = scale_to_total(proxy_up, limit_up, estimated_up);
+                direct_up = scale_to_total(direct_up, limit_up, estimated_up);
+            }
+            let bucket = buckets
+                .entry(bar_bucket_start(minute, bar_mode))
+                .or_insert((0, 0, 0, 0, false));
+            bucket.2 = bucket.2.saturating_add(proxy_down.saturating_add(proxy_up));
+            bucket.3 = bucket
+                .3
+                .saturating_add(direct_down.saturating_add(direct_up));
         }
         let bars = buckets
             .into_iter()
-            .map(|(start, (download, upload, gap))| HistoryBar {
-                start,
-                label: bar_label(start, bar_mode),
-                download,
-                upload,
-                gap,
-            })
+            .map(
+                |(start, (download, upload, proxy_total, direct_total, gap))| HistoryBar {
+                    start,
+                    label: bar_label(start, bar_mode),
+                    download,
+                    upload,
+                    proxy_total,
+                    direct_total,
+                    gap,
+                },
+            )
             .collect();
         Ok((totals_down, totals_up, gaps, bars))
     }
@@ -271,10 +329,11 @@ impl HistoryStore {
         })?;
         let mut totals_by_minute = BTreeMap::new();
         let mut gap_minutes = 0u64;
-        let mut buckets: BTreeMap<i64, (u64, u64, bool)> = bar_bucket_starts(from, to, bar_mode)
-            .into_iter()
-            .map(|start| (start, (0, 0, false)))
-            .collect();
+        let mut buckets: BTreeMap<i64, (u64, u64, u64, u64, bool)> =
+            bar_bucket_starts(from, to, bar_mode)
+                .into_iter()
+                .map(|start| (start, (0, 0, 0, 0, false)))
+                .collect();
         for row in total_rows {
             let (minute, download, upload, gap) = row?;
             totals_by_minute.insert(
@@ -289,7 +348,7 @@ impl HistoryStore {
                 buckets
                     .entry(bar_bucket_start(minute, bar_mode))
                     .or_default()
-                    .2 = true;
+                    .4 = true;
             }
         }
 
@@ -373,6 +432,15 @@ impl HistoryStore {
                 total_upload = total_upload.saturating_add(upload);
                 bucket.0 = bucket.0.saturating_add(download);
                 bucket.1 = bucket.1.saturating_add(upload);
+                match sample.route_class {
+                    RouteClass::Proxy => {
+                        bucket.2 = bucket.2.saturating_add(download.saturating_add(upload));
+                    }
+                    RouteClass::Direct => {
+                        bucket.3 = bucket.3.saturating_add(download.saturating_add(upload));
+                    }
+                    RouteClass::Blocked | RouteClass::Unknown => {}
+                }
 
                 let (label, app, route) = row_identity(
                     breakdown,
@@ -411,13 +479,17 @@ impl HistoryStore {
         });
         let bars = buckets
             .into_iter()
-            .map(|(start, (download, upload, gap))| HistoryBar {
-                start,
-                label: bar_label(start, bar_mode),
-                download,
-                upload,
-                gap,
-            })
+            .map(
+                |(start, (download, upload, proxy_total, direct_total, gap))| HistoryBar {
+                    start,
+                    label: bar_label(start, bar_mode),
+                    download,
+                    upload,
+                    proxy_total,
+                    direct_total,
+                    gap,
+                },
+            )
             .collect();
         Ok((total_download, total_upload, gap_minutes, bars, rows))
     }
@@ -942,6 +1014,14 @@ mod tests {
                 .iter()
                 .any(|row| row.label == "Unattributed" && row.route_class == RouteClass::Unknown)
         );
+        let chart_period = app
+            .bars
+            .iter()
+            .find(|bar| bar.start == bar_bucket_start(minute_start(now), BarMode::Hour))
+            .unwrap();
+        assert_eq!(chart_period.proxy_total, 280);
+        assert_eq!(chart_period.direct_total, 300);
+        assert!(chart_period.proxy_total + chart_period.direct_total < app.total);
 
         let grouped = history
             .report("today", "customGroup", &groups, now)
@@ -1130,6 +1210,47 @@ mod tests {
             filtered.available_apps,
             vec!["ChatGPT.exe", "codex.exe", "steam.exe"]
         );
+        assert_eq!(
+            filtered
+                .bars
+                .iter()
+                .map(|bar| bar.direct_total)
+                .sum::<u64>(),
+            filtered.total
+        );
+        assert_eq!(
+            filtered.bars.iter().map(|bar| bar.proxy_total).sum::<u64>(),
+            0,
+            "a Direct filter must keep the Proxy chart lane empty"
+        );
+
+        let proxy_only = history
+            .report_with_filters(
+                "7d",
+                "customGroup",
+                &groups,
+                now,
+                Some(HistoryRouteFilter::Proxy),
+                Some(&ai_filter),
+            )
+            .unwrap();
+        assert_eq!(
+            proxy_only
+                .bars
+                .iter()
+                .map(|bar| bar.proxy_total)
+                .sum::<u64>(),
+            proxy_only.total
+        );
+        assert_eq!(
+            proxy_only
+                .bars
+                .iter()
+                .map(|bar| bar.direct_total)
+                .sum::<u64>(),
+            0,
+            "a Proxy filter must keep the Direct chart lane empty"
+        );
 
         let no_match = history
             .report_with_filters(
@@ -1147,7 +1268,99 @@ mod tests {
         assert!(no_match.rows.is_empty());
         assert_eq!(no_match.gap_minutes, 1);
         assert!(no_match.bars.iter().any(|bar| bar.gap));
+        assert!(
+            no_match
+                .bars
+                .iter()
+                .all(|bar| bar.proxy_total == 0 && bar.direct_total == 0)
+        );
         assert_eq!(no_match.available_apps, filtered.available_apps);
+    }
+
+    #[test]
+    fn route_chart_values_exclude_other_classes_and_stay_within_minute_totals() {
+        let mut history = memory();
+        let now = Local::now().timestamp();
+        history.record_totals(now, 100, 50).unwrap();
+        history
+            .record_apps(
+                now,
+                &[
+                    (
+                        "A.exe".into(),
+                        "Proxy node".into(),
+                        RouteClass::Proxy,
+                        20,
+                        10,
+                    ),
+                    ("B.exe".into(), "Direct".into(), RouteClass::Direct, 180, 80),
+                    (
+                        "C.exe".into(),
+                        "Blocked".into(),
+                        RouteClass::Blocked,
+                        50,
+                        25,
+                    ),
+                    (
+                        "D.exe".into(),
+                        "Unknown".into(),
+                        RouteClass::Unknown,
+                        60,
+                        30,
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let all = history.report("today", "app", &[], now).unwrap();
+        let period = all
+            .bars
+            .iter()
+            .find(|bar| bar.start == bar_bucket_start(minute_start(now), BarMode::Hour))
+            .unwrap();
+        assert_eq!(period.proxy_total, 15);
+        assert_eq!(period.direct_total, 134);
+        assert!(period.proxy_total + period.direct_total <= all.total);
+
+        let direct = history
+            .report_with_filters(
+                "today",
+                "app",
+                &[],
+                now,
+                Some(HistoryRouteFilter::Direct),
+                None,
+            )
+            .unwrap();
+        assert_eq!(direct.total, 150);
+        assert_eq!(
+            direct.bars.iter().map(|bar| bar.direct_total).sum::<u64>(),
+            150
+        );
+        assert_eq!(
+            direct.bars.iter().map(|bar| bar.proxy_total).sum::<u64>(),
+            0
+        );
+
+        let proxy = history
+            .report_with_filters(
+                "today",
+                "app",
+                &[],
+                now,
+                Some(HistoryRouteFilter::Proxy),
+                None,
+            )
+            .unwrap();
+        assert_eq!(proxy.total, 30);
+        assert_eq!(
+            proxy.bars.iter().map(|bar| bar.proxy_total).sum::<u64>(),
+            30
+        );
+        assert_eq!(
+            proxy.bars.iter().map(|bar| bar.direct_total).sum::<u64>(),
+            0
+        );
     }
 
     #[test]
@@ -1261,5 +1474,20 @@ mod tests {
         assert_eq!((direct.total_download, direct.total_upload), (10, 4));
         assert_eq!(direct.rows.len(), 1);
         assert_eq!(direct.rows[0].route_class, RouteClass::Direct);
+        assert_eq!(
+            direct.bars.iter().map(|bar| bar.direct_total).sum::<u64>(),
+            14
+        );
+        assert_eq!(
+            direct.bars.iter().map(|bar| bar.proxy_total).sum::<u64>(),
+            0
+        );
+
+        assert!(
+            report
+                .bars
+                .iter()
+                .all(|bar| bar.proxy_total + bar.direct_total <= bar.download + bar.upload)
+        );
     }
 }

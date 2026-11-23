@@ -4,6 +4,7 @@ use crate::models::{
 };
 use anyhow::{Context, Result, bail};
 use serde_yaml_ng::{Mapping, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -29,6 +30,68 @@ pub struct CompiledRuntime {
     pub yaml: String,
     pub node_routes: BTreeMap<String, String>,
     pub rule_groups: BTreeMap<String, String>,
+    pub node_fingerprints: BTreeMap<String, String>,
+}
+
+/// A resident, inert core used to avoid a cold process start on the user's Connect action.
+/// It has no traffic listeners, DNS listener, proxies, or enabled TUN; only the authenticated
+/// loopback controller remains reachable for the later staged config reload.
+pub fn build_standby_yaml(controller: &ControllerConfig) -> Result<String> {
+    let mut root = Mapping::new();
+    map_insert(&mut root, "mixed-port", Value::from(0));
+    map_insert(&mut root, "allow-lan", Value::Bool(false));
+    map_insert(&mut root, "mode", Value::String("rule".to_owned()));
+    map_insert(&mut root, "log-level", Value::String("warning".to_owned()));
+    map_insert(&mut root, "ipv6", Value::Bool(true));
+    map_insert(
+        &mut root,
+        "find-process-mode",
+        Value::String("off".to_owned()),
+    );
+    map_insert(&mut root, "unified-delay", Value::Bool(true));
+    map_insert(
+        &mut root,
+        "external-controller",
+        Value::String(format!("127.0.0.1:{}", controller.port)),
+    );
+    map_insert(
+        &mut root,
+        "secret",
+        Value::String(controller.secret.clone()),
+    );
+
+    let mut cors = Mapping::new();
+    map_insert(&mut cors, "allow-private-network", Value::Bool(false));
+    map_insert(&mut cors, "allow-origins", Value::Sequence(Vec::new()));
+    map_insert(&mut root, "external-controller-cors", Value::Mapping(cors));
+
+    let mut profile = Mapping::new();
+    map_insert(&mut profile, "store-selected", Value::Bool(false));
+    map_insert(&mut profile, "store-fake-ip", Value::Bool(false));
+    map_insert(&mut root, "profile", Value::Mapping(profile));
+
+    let mut tun = Mapping::new();
+    map_insert(&mut tun, "enable", Value::Bool(false));
+    map_insert(&mut tun, "stack", Value::String("mixed".to_owned()));
+    map_insert(&mut tun, "device", Value::String(TUN_DEVICE.to_owned()));
+    map_insert(&mut tun, "auto-route", Value::Bool(true));
+    map_insert(&mut tun, "auto-detect-interface", Value::Bool(true));
+    map_insert(&mut tun, "strict-route", Value::Bool(true));
+    map_insert(
+        &mut tun,
+        "dns-hijack",
+        sequence_strings(&["any:53", "tcp://any:53"]),
+    );
+    map_insert(&mut root, "tun", Value::Mapping(tun));
+
+    let mut dns = Mapping::new();
+    map_insert(&mut dns, "enable", Value::Bool(false));
+    map_insert(&mut root, "dns", Value::Mapping(dns));
+    map_insert(&mut root, "proxies", Value::Sequence(Vec::new()));
+    map_insert(&mut root, "proxy-groups", Value::Sequence(Vec::new()));
+    map_insert(&mut root, "rules", sequence_strings(&["MATCH,DIRECT"]));
+
+    serde_yaml_ng::to_string(&Value::Mapping(root)).context("failed to serialize standby config")
 }
 
 pub fn generate_id(prefix: &str) -> String {
@@ -164,20 +227,33 @@ pub fn validate_match_group(group: &MatchGroup) -> Result<()> {
 
 pub fn validate_ruleset(ruleset: &Ruleset, state: &AppState) -> Result<()> {
     validate_ruleset_name(&ruleset.name)?;
-    let mut seen_groups = BTreeSet::new();
     for entry in &ruleset.entries {
-        if !seen_groups.insert(entry.match_group_id.clone()) {
-            bail!("A match group can appear only once in a ruleset.");
-        }
-        let group = state
-            .match_groups
-            .iter()
-            .find(|group| group.id == entry.match_group_id)
-            .context("A ruleset entry references a missing match group.")?;
-        validate_match_group(group)?;
+        let conditions = if entry.conditions.is_empty() {
+            &state
+                .match_groups
+                .iter()
+                .find(|g| g.id == entry.match_group_id)
+                .context("A ruleset entry references a missing match group.")?
+                .conditions
+        } else {
+            &entry.conditions
+        };
+        let group = MatchGroup {
+            id: entry.id.clone(),
+            name: if entry.name.is_empty() {
+                "Rule".into()
+            } else {
+                entry.name.clone()
+            },
+            conditions: conditions.clone(),
+        };
+        validate_match_group(&group)?;
         if let Destination::Node { node_id } = &entry.destination {
             validate_node_reference(state, node_id)?;
         }
+    }
+    if let crate::models::Miscellaneous::Node { node_id } = &ruleset.miscellaneous {
+        validate_node_reference(state, node_id)?;
     }
     Ok(())
 }
@@ -282,11 +358,6 @@ pub fn compile_rule_lines(state: &AppState, selection: &Selection) -> Result<Vec
         Mode::Rule => {
             let ruleset = active_ruleset(state, selection)?;
             validate_ruleset(ruleset, state)?;
-            let groups: BTreeMap<&str, &MatchGroup> = state
-                .match_groups
-                .iter()
-                .map(|group| (group.id.as_str(), group))
-                .collect();
             let nodes: BTreeMap<&str, &NodeView> = state
                 .nodes
                 .iter()
@@ -294,15 +365,22 @@ pub fn compile_rule_lines(state: &AppState, selection: &Selection) -> Result<Vec
                 .collect();
             let mut rules = Vec::new();
             for entry in &ruleset.entries {
-                let group = groups
-                    .get(entry.match_group_id.as_str())
-                    .context("A ruleset references a missing match group.")?;
+                let conditions = if entry.conditions.is_empty() {
+                    &state
+                        .match_groups
+                        .iter()
+                        .find(|g| g.id == entry.match_group_id)
+                        .context("A ruleset references a missing match group.")?
+                        .conditions
+                } else {
+                    &entry.conditions
+                };
                 match &entry.destination {
                     Destination::Direct => {
-                        compile_conditions(&group.conditions, "DIRECT", false, &mut rules)?;
+                        compile_conditions(conditions, "DIRECT", false, &mut rules)?;
                     }
                     Destination::Block => {
-                        compile_conditions(&group.conditions, "REJECT", false, &mut rules)?;
+                        compile_conditions(conditions, "REJECT", false, &mut rules)?;
                     }
                     Destination::Node { node_id } => {
                         let node = nodes
@@ -311,15 +389,24 @@ pub fn compile_rule_lines(state: &AppState, selection: &Selection) -> Result<Vec
                         if node.missing {
                             bail!("A ruleset references a node missing from its service.");
                         }
-                        compile_conditions(&group.conditions, &node.core_name, true, &mut rules)?;
+                        compile_conditions(conditions, &node.core_name, true, &mut rules)?;
                     }
                 }
             }
             rules.push(format!(
                 "MATCH,{}",
-                match ruleset.miscellaneous {
-                    crate::models::Miscellaneous::Direct => "DIRECT",
-                    crate::models::Miscellaneous::Block => "REJECT",
+                match &ruleset.miscellaneous {
+                    crate::models::Miscellaneous::Direct => "DIRECT".to_owned(),
+                    crate::models::Miscellaneous::Block => "REJECT".to_owned(),
+                    crate::models::Miscellaneous::Node { node_id } => {
+                        let node = nodes
+                            .get(node_id.as_str())
+                            .context("The catch-all references a missing node.")?;
+                        if node.missing {
+                            bail!("The catch-all references a node missing from its service.");
+                        }
+                        node.core_name.clone()
+                    }
                 }
             ));
             Ok(rules)
@@ -332,6 +419,34 @@ fn required_str<'a>(mapping: &'a Mapping, key: &str) -> Result<&'a str> {
         .get(Value::String(key.to_owned()))
         .and_then(Value::as_str)
         .with_context(|| format!("A stored node is missing its {key} field."))
+}
+
+fn normalized_node_proxy(node: &NodeView, raw: &Value) -> Result<Option<(Mapping, String)>> {
+    let mut proxy = raw
+        .as_mapping()
+        .cloned()
+        .context("A stored node definition is invalid.")?;
+    let kind = required_str(&proxy, "type")?.to_ascii_lowercase();
+    if !matches!(kind.as_str(), "trojan" | "ss" | "vmess" | "vless") {
+        return Ok(None);
+    }
+    map_insert(&mut proxy, "name", Value::String(node.core_name.clone()));
+    let serialized = serde_yaml_ng::to_string(&Value::Mapping(proxy.clone()))
+        .context("Could not fingerprint the node definition.")?;
+    let digest = Sha256::digest(serialized.as_bytes());
+    let fingerprint = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(Some((proxy, fingerprint)))
+}
+
+/// A local, nonreversible identity for the exact proxy definition Mihomo receives.
+/// It is kept in the protected local store and is never returned to the renderer.
+pub fn node_definition_fingerprint(node: &NodeView, raw: &Value) -> Result<String> {
+    normalized_node_proxy(node, raw)?
+        .map(|(_, fingerprint)| fingerprint)
+        .context("This node protocol cannot be tested.")
 }
 
 fn map_insert(mapping: &mut Mapping, key: &str, value: Value) {
@@ -358,6 +473,7 @@ pub fn build_runtime_yaml(
 
     let mut proxies = Vec::new();
     let mut node_routes = BTreeMap::new();
+    let mut node_fingerprints = BTreeMap::new();
     for node in state.nodes.iter().filter(|node| !node.missing) {
         let proxy = secrets.nodes.get(&node.id).with_context(|| {
             format!(
@@ -365,16 +481,11 @@ pub fn build_runtime_yaml(
                 node.display_name
             )
         })?;
-        let mut proxy = proxy
-            .as_mapping()
-            .cloned()
-            .context("A stored node definition is invalid.")?;
-        let kind = required_str(&proxy, "type")?.to_ascii_lowercase();
-        if !matches!(kind.as_str(), "trojan" | "ss" | "vmess" | "vless") {
+        let Some((proxy, fingerprint)) = normalized_node_proxy(node, proxy)? else {
             continue;
-        }
-        map_insert(&mut proxy, "name", Value::String(node.core_name.clone()));
+        };
         proxies.push(Value::Mapping(proxy));
+        node_fingerprints.insert(node.id.clone(), fingerprint);
         node_routes.insert(
             node.core_name.clone(),
             format!("{} / {}", node.service_title, node.display_name),
@@ -578,6 +689,7 @@ pub fn build_runtime_yaml(
         yaml,
         node_routes,
         rule_groups,
+        node_fingerprints,
     })
 }
 
@@ -591,12 +703,19 @@ pub fn validate_with_core(
     use std::process::Command;
     std::fs::create_dir_all(data_dir)?;
     let temp = crate::paths::private_temp_file(data_dir, "check", yaml.as_bytes())?;
-    let output = Command::new(core)
+    let mut command = Command::new(core);
+    command
         .arg("-t")
         .arg("-d")
         .arg(data_dir)
         .arg("-f")
-        .arg(&temp)
+        .arg(&temp);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let output = command
         .output()
         .context("Could not start the bundled core for configuration validation.")?;
     let _ = std::fs::remove_file(&temp);
@@ -613,6 +732,30 @@ pub fn validate_with_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standby_config_is_inert_and_only_exposes_the_loopback_controller() {
+        let controller = ControllerConfig {
+            port: 19_000,
+            secret: "fixture-secret".into(),
+            dns_port: 19_198,
+        };
+        let yaml = build_standby_yaml(&controller).unwrap();
+        let value: Value = serde_yaml_ng::from_str(&yaml).unwrap();
+
+        assert_eq!(value["mixed-port"].as_i64(), Some(0));
+        assert_eq!(value["allow-lan"].as_bool(), Some(false));
+        assert_eq!(
+            value["external-controller"].as_str(),
+            Some("127.0.0.1:19000")
+        );
+        assert_eq!(value["tun"]["enable"].as_bool(), Some(false));
+        assert_eq!(value["tun"]["strict-route"].as_bool(), Some(true));
+        assert_eq!(value["dns"]["enable"].as_bool(), Some(false));
+        assert!(value["proxies"].as_sequence().unwrap().is_empty());
+        assert!(value["proxy-groups"].as_sequence().unwrap().is_empty());
+        assert_eq!(value["rules"][0].as_str(), Some("MATCH,DIRECT"));
+    }
     use crate::models::*;
 
     fn node(id: &str, core: &str) -> NodeView {
@@ -623,8 +766,30 @@ mod tests {
             display_name: "Singapore I0".into(),
             protocol: "Trojan".into(),
             missing: false,
+            omitted_once: false,
             core_name: core.into(),
+            latency_ms: None,
+            latency_measured_at_ms: None,
         }
+    }
+
+    #[test]
+    fn node_fingerprint_changes_when_its_proxy_definition_changes() {
+        let target = node("node-test", "CF-test");
+        let mut proxy: Value = serde_yaml_ng::from_str(
+            "type: trojan\nserver: fixture.invalid\nport: 443\npassword: fixture-only\n",
+        )
+        .unwrap();
+        let original = node_definition_fingerprint(&target, &proxy).unwrap();
+        assert_eq!(
+            node_definition_fingerprint(&target, &proxy).unwrap(),
+            original
+        );
+        proxy["server"] = Value::String("rotated.fixture.invalid".to_owned());
+        assert_ne!(
+            node_definition_fingerprint(&target, &proxy).unwrap(),
+            original
+        );
     }
 
     fn base() -> (AppState, SecretStore, Selection) {
@@ -659,6 +824,8 @@ mod tests {
                 entries: vec![RulesetEntry {
                     id: "entry-1".into(),
                     match_group_id: "group-1".into(),
+                    name: String::new(),
+                    conditions: Vec::new(),
                     destination: Destination::Node {
                         node_id: "node-1".into(),
                     },
@@ -731,6 +898,8 @@ mod tests {
             RulesetEntry {
                 id: "entry-2".into(),
                 match_group_id: "group-2".into(),
+                name: String::new(),
+                conditions: Vec::new(),
                 destination: Destination::Direct,
             },
         );
@@ -747,6 +916,12 @@ mod tests {
         for (miscellaneous, expected) in [
             (Miscellaneous::Direct, "MATCH,DIRECT"),
             (Miscellaneous::Block, "MATCH,REJECT"),
+            (
+                Miscellaneous::Node {
+                    node_id: "node-2".into(),
+                },
+                "MATCH,cf_node_2",
+            ),
         ] {
             state.rulesets[0].miscellaneous = miscellaneous;
             selection_is_valid(&state, &selection).unwrap();
@@ -996,6 +1171,85 @@ mod tests {
                 build_runtime_yaml(&state, &secrets, &selection, &controller, true).unwrap();
             validate_with_core(&core, scratch.path(), &config.yaml).unwrap();
         }
+        let standby = build_standby_yaml(&controller).unwrap();
+        validate_with_core(&core, scratch.path(), &standby).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the bundled Mihomo executable"]
+    async fn stock_mihomo_reloads_from_inert_standby_without_restarting() {
+        use std::{
+            net::TcpListener,
+            path::Path,
+            process::{Child, Command, Stdio},
+        };
+
+        struct RunningCore(Child);
+        impl Drop for RunningCore {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let dns = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let controller = ControllerConfig {
+            port: listener.local_addr().unwrap().port(),
+            secret: "clashfork-standby-fixture".into(),
+            dns_port: dns.local_addr().unwrap().port(),
+        };
+        drop(listener);
+        drop(dns);
+
+        let (state, secrets, selection) = base();
+        let standby = build_standby_yaml(&controller).unwrap();
+        let app_config = build_runtime_yaml(&state, &secrets, &selection, &controller, false)
+            .unwrap()
+            .yaml;
+        let scratch = tempfile::tempdir().unwrap();
+        let standby_file = scratch.path().join("standby.yaml");
+        let app_file = scratch.path().join("app.yaml");
+        std::fs::write(&standby_file, standby).unwrap();
+        std::fs::write(&app_file, app_config).unwrap();
+
+        let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/clashfork-core.exe");
+        let child = Command::new(core)
+            .arg("-d")
+            .arg(scratch.path())
+            .arg("-f")
+            .arg(&standby_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let process_id = child.id();
+        let _child = RunningCore(child);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let controller = crate::controller::CoreController::new(
+            controller.port,
+            controller.secret.clone(),
+            client,
+        );
+
+        crate::service_client::wait_ready_config(&controller, "rule", false)
+            .await
+            .unwrap();
+        controller.reload(app_file.to_str().unwrap()).await.unwrap();
+        let active = crate::service_client::wait_ready_config(&controller, "rule", false)
+            .await
+            .unwrap();
+        assert_eq!(active.tun_enabled, Some(false));
+
+        controller
+            .reload(standby_file.to_str().unwrap())
+            .await
+            .unwrap();
+        let idle = crate::service_client::wait_ready_config(&controller, "rule", false)
+            .await
+            .unwrap();
+        assert_eq!(idle.tun_enabled, Some(false));
+        assert_eq!(process_id, _child.0.id());
     }
 
     #[tokio::test]
@@ -1060,7 +1314,7 @@ mod tests {
             config.secret.clone(),
             client.clone(),
         );
-        crate::service_client::wait_ready(&controller)
+        crate::service_client::wait_ready_mode(&controller, "rule")
             .await
             .unwrap();
 

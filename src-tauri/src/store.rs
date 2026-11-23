@@ -17,8 +17,30 @@ pub fn load_state(paths: &AppPaths) -> Result<AppState> {
     if state.schema_version == 0 {
         state.schema_version = 1;
     }
-    if state.schema_version != 1 {
+    if state.schema_version > 2 {
         anyhow::bail!("unsupported local state schema");
+    }
+    // Schema 2 makes each rule own its conditions. Copy legacy shared groups into
+    // every referenced rule while retaining all groups for later condition copying.
+    if state.schema_version < 2 {
+        for ruleset in &mut state.rulesets {
+            for entry in &mut ruleset.entries {
+                if entry.conditions.is_empty() {
+                    if let Some(group) = state
+                        .match_groups
+                        .iter()
+                        .find(|g| g.id == entry.match_group_id)
+                    {
+                        entry.name = group.name.clone();
+                        entry.conditions = group.conditions.clone();
+                        for condition in &mut entry.conditions {
+                            condition.id = format!("{}:{}", entry.id, condition.id);
+                        }
+                    }
+                }
+            }
+        }
+        state.schema_version = 2;
     }
     repair_references(&mut state);
     Ok(state)
@@ -70,16 +92,6 @@ fn repair_references(state: &mut AppState) {
             node.service_title = title.clone();
         }
     }
-    let group_ids: std::collections::BTreeSet<_> = state
-        .match_groups
-        .iter()
-        .map(|group| group.id.clone())
-        .collect();
-    for ruleset in &mut state.rulesets {
-        ruleset
-            .entries
-            .retain(|entry| group_ids.contains(&entry.match_group_id));
-    }
     if state
         .selection
         .ruleset_id
@@ -117,7 +129,7 @@ mod tests {
         let state = AppState::default();
         save_state(&paths, &state).unwrap();
         let loaded = load_state(&paths).unwrap();
-        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.schema_version, 2);
         assert!(loaded.services.is_empty());
     }
 
@@ -149,8 +161,133 @@ mod tests {
             Some("ruleset-empty")
         );
         let value = serde_json::to_value(&loaded.rulesets[0]).unwrap();
-        assert_eq!(value["miscellaneous"], "block");
+        assert_eq!(value["miscellaneous"], serde_json::json!({"kind":"block"}));
+        assert_eq!(
+            serde_json::from_value::<Miscellaneous>(serde_json::json!("block")).unwrap(),
+            Miscellaneous::Block
+        );
         assert_eq!(value["entries"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn schema_one_migration_copies_shared_conditions_and_keeps_unused_groups_and_routes() {
+        use crate::models::{ConditionKind, Destination, MatchCondition, MatchGroup, RulesetEntry};
+        let dir = tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("appdata")).unwrap();
+        let mut state = AppState::default();
+        state.schema_version = 1;
+        state.nodes.push(crate::models::NodeView {
+            id: "node-a".into(),
+            service_id: "svc".into(),
+            service_title: "Service".into(),
+            display_name: "Node A".into(),
+            protocol: "ss".into(),
+            missing: false,
+            omitted_once: false,
+            core_name: "Node-A".into(),
+            latency_ms: None,
+            latency_measured_at_ms: None,
+        });
+        state.services.push(crate::models::ServiceView {
+            id: "svc".into(),
+            title: "Service".into(),
+            source_type: crate::models::SourceType::Manual,
+            source_host: None,
+            node_count: 1,
+            missing_count: 0,
+            allowance: crate::models::Allowance::Unavailable,
+            stale: false,
+            omitted_node_ids: vec![],
+            last_refresh_at: None,
+            last_error: None,
+        });
+        state.match_groups = vec![
+            MatchGroup {
+                id: "shared".into(),
+                name: "Shared label".into(),
+                conditions: vec![MatchCondition {
+                    id: "c1".into(),
+                    kind: ConditionKind::DomainSuffix,
+                    value: "example.org".into(),
+                }],
+            },
+            MatchGroup {
+                id: "unused".into(),
+                name: "Unused source".into(),
+                conditions: vec![MatchCondition {
+                    id: "c2".into(),
+                    kind: ConditionKind::ProcessName,
+                    value: "app.exe".into(),
+                }],
+            },
+        ];
+        state.rulesets.push(crate::models::Ruleset {
+            id: "r1".into(),
+            name: "Kept".into(),
+            entries: vec![
+                RulesetEntry {
+                    id: "e1".into(),
+                    match_group_id: "shared".into(),
+                    name: String::new(),
+                    conditions: vec![],
+                    destination: Destination::Node {
+                        node_id: "node-a".into(),
+                    },
+                },
+                RulesetEntry {
+                    id: "e2".into(),
+                    match_group_id: "shared".into(),
+                    name: String::new(),
+                    conditions: vec![],
+                    destination: Destination::Block,
+                },
+            ],
+            miscellaneous: crate::models::Miscellaneous::Block,
+        });
+        state.selection.ruleset_id = Some("r1".into());
+        let mut value = serde_json::to_value(state).unwrap();
+        value["schemaVersion"] = serde_json::json!(1);
+        std::fs::write(&paths.state_file, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = load_state(&paths).unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.rulesets[0].entries[0].name, "Shared label");
+        assert_eq!(
+            loaded.rulesets[0].entries[0].conditions[0].value,
+            "example.org"
+        );
+        assert_ne!(
+            loaded.rulesets[0].entries[0].conditions[0].id,
+            loaded.rulesets[0].entries[1].conditions[0].id
+        );
+        assert!(
+            matches!(loaded.rulesets[0].entries[0].destination, Destination::Node { ref node_id } if node_id == "node-a")
+        );
+        assert!(matches!(
+            loaded.rulesets[0].entries[1].destination,
+            Destination::Block
+        ));
+        assert_eq!(
+            loaded.rulesets[0].miscellaneous,
+            crate::models::Miscellaneous::Block
+        );
+        assert_eq!(loaded.selection.ruleset_id.as_deref(), Some("r1"));
+        assert_eq!(loaded.match_groups.len(), 2);
+        assert_eq!(loaded.match_groups[1].id, "unused");
+        let compiled = crate::rules::compile_rule_lines(&loaded, &loaded.selection).unwrap();
+        assert_eq!(compiled[0], "DOMAIN-SUFFIX,example.org,Node-A");
+        assert_eq!(compiled[1], "DOMAIN-SUFFIX,example.org,REJECT");
+        assert_eq!(compiled[2], "DOMAIN-SUFFIX,example.org,REJECT");
+        assert_eq!(compiled.last().unwrap(), "MATCH,REJECT");
+    }
+
+    #[test]
+    fn malformed_state_is_never_rewritten_by_load_or_migration() {
+        let dir = tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("appdata")).unwrap();
+        let malformed = br#"{"schemaVersion":1,"rulesets":["#;
+        std::fs::write(&paths.state_file, malformed).unwrap();
+        assert!(load_state(&paths).is_err());
+        assert_eq!(std::fs::read(&paths.state_file).unwrap(), malformed);
     }
 
     #[test]
@@ -165,6 +302,14 @@ mod tests {
         secrets.nodes.insert(
             "node".into(),
             serde_yaml_ng::from_str("password: fixture-private-password\n").unwrap(),
+        );
+        secrets.node_latencies.insert(
+            "node".into(),
+            crate::models::StoredNodeLatency {
+                definition_fingerprint: "fixture-fingerprint".into(),
+                latency_ms: 142,
+                measured_at_ms: 1_800_000_000_000,
+            },
         );
         save_secrets(&paths, &secrets).unwrap();
         let disk = std::fs::read(&paths.secrets_file).unwrap();
@@ -183,5 +328,8 @@ mod tests {
             loaded.subscriptions.get("svc").unwrap(),
             "https://fixture.invalid/sub/private-path-token"
         );
+        let latency = loaded.node_latencies.get("node").unwrap();
+        assert_eq!(latency.latency_ms, 142);
+        assert_eq!(latency.measured_at_ms, 1_800_000_000_000);
     }
 }

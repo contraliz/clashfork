@@ -1,572 +1,320 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
-import type {
-  ConditionKind,
-  Destination,
-  MatchGroup,
-  Ruleset,
-  RulesetEntry,
-  Snapshot,
-} from '../types'
-import {
-  Button,
-  EmptyState,
-  Field,
-  Grid,
-  GridItem,
-  IconButton,
-  Modal,
-  PageHeader,
-  Panel,
-  SourceBadge,
-} from '../components/ui'
+import { SelectedNodeLatency } from '../components/NodeLatency'
+import { useNowMs } from '../hooks'
+import type { ConditionKind, Destination, MatchCondition, NodeView, Ruleset, RulesetEntry, Snapshot } from '../types'
+import { Button, EmptyState, Field, IconButton, Modal, PageHeader, Panel, Toolbar } from '../components/ui'
 
-interface Props {
-  snapshot: Snapshot
-  onSnapshot: (snapshot: Snapshot) => void
-  onError: (error: unknown) => void
+interface Props { snapshot: Snapshot; onSnapshot: (snapshot: Snapshot) => void; onError: (error: unknown) => void }
+type Draft = { id: string | null; name: string; entries: RulesetEntry[]; miscellaneous: Destination }
+type PortableDestination = { kind: 'direct' } | { kind: 'block' } | { kind: 'proxy'; proxyRef: string; label: string }
+type PortableRule = { name: string; conditions: Array<{ kind: ConditionKind; value: string }>; destination: PortableDestination }
+type PortableDoc = { format: 'clashfork-routing'; version: 1; type: 'rule' | 'ruleset'; name?: string; rules?: PortableRule[]; rule?: PortableRule; miscellaneous?: 'direct' | 'block' | PortableDestination }
+const kinds: Record<ConditionKind, string> = { process_name: 'Process name', process_path: 'Process path', domain: 'Domain exact', domain_suffix: 'Domain suffix', ipv4_cidr: 'IPv4 CIDR', ipv6_cidr: 'IPv6 CIDR' }
+const newId = () => `local_${crypto.randomUUID()}`
+const makeCondition = (kind: ConditionKind = 'domain_suffix', value = ''): MatchCondition => ({ id: newId(), kind, value })
+const validPortableCondition = (kind: ConditionKind, input: string) => {
+  const value = input.trim()
+  if (!value || value.length > 512 || /[,\x00-\x1f\x7f]/.test(value)) return false
+  if (kind === 'process_name') return !/[\\/:]/.test(value)
+  if (kind === 'process_path') return value.startsWith('/') || value.startsWith('\\\\') || /^[A-Za-z]:/.test(value)
+  if (kind === 'domain' || kind === 'domain_suffix') {
+    if (value.includes('://') || /[/:]/.test(value)) return false
+    const domain = value.replace(/^\.+|\.+$/g, '')
+    return domain.length <= 253 && domain.split('.').every(label => label.length > 0 && label.length <= 63 && /^[A-Za-z0-9_-]+$/.test(label) && !label.startsWith('-') && !label.endsWith('-'))
+  }
+  const [address, prefix, ...extra] = value.split('/')
+  if (extra.length || !/^\d+$/.test(prefix ?? '')) return false
+  const bits = Number(prefix)
+  if (kind === 'ipv4_cidr') {
+    const octets = address.split('.')
+    return bits <= 32 && octets.length === 4 && octets.every(octet => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
+  }
+  if (bits > 128) return false
+  try { return new URL(`http://[${address}]/`).hostname.startsWith('[') } catch { return false }
+}
+const emptyDraft = (): Draft => ({ id: null, name: '', entries: [], miscellaneous: { kind: 'direct' } })
+const entryFrom = (name: string, conditions: MatchCondition[] = [makeCondition()]): RulesetEntry => ({ id: newId(), matchGroupId: '', name, conditions, destination: { kind: 'direct' } })
+const fromRuleset = (r: Ruleset): Draft => ({ id: r.id, name: r.name, entries: structuredClone(r.entries), miscellaneous: r.miscellaneous })
+
+function destinationValue(destination: Destination): string {
+  return destination.kind === 'node' ? `node:${destination.nodeId}` : destination.kind
 }
 
-interface RulesetDraft {
-  id: string | null
-  name: string
-  entries: RulesetEntry[]
-  miscellaneous: 'direct' | 'block'
+function destinationFromValue(value: string): Destination {
+  return value.startsWith('node:') ? { kind: 'node', nodeId: value.slice(5) } : { kind: value as 'direct' | 'block' }
 }
 
-const emptyDraft = (): RulesetDraft => ({
-  id: null,
-  name: '',
-  entries: [],
-  miscellaneous: 'direct',
-})
+function portableDestination(nodeId: string, nodes: NodeView[], refs: Map<string, string>): PortableDestination {
+  const node = nodes.find(candidate => candidate.id === nodeId)
+  const ref = refs.get(nodeId) ?? `proxy-${refs.size + 1}`
+  refs.set(nodeId, ref)
+  return { kind: 'proxy', proxyRef: ref, label: `Proxy ${Number(ref.slice(6)) || 1}${node ? ` · ${node.protocol}` : ''}` }
+}
 
-const conditionLabels: Record<ConditionKind, string> = {
-  process_name: 'Process name',
-  process_path: 'Process path',
-  domain: 'Domain exact',
-  domain_suffix: 'Domain suffix',
-  ipv4_cidr: 'IPv4 CIDR',
-  ipv6_cidr: 'IPv6 CIDR',
+function DestinationPicker({ destination, nodes, label, showLabel = true, inlineLatency = false, now, onChange }: {
+  destination: Destination
+  nodes: NodeView[]
+  label: string
+  showLabel?: boolean
+  inlineLatency?: boolean
+  now: number
+  onChange: (destination: Destination) => void
+}) {
+  const selectedNode = destination.kind === 'node' ? nodes.find(node => node.id === destination.nodeId) : undefined
+  const groups = new Map<string, NodeView[]>()
+  for (const node of nodes.filter(item => !item.missing)) {
+    const list = groups.get(node.serviceTitle) ?? []
+    list.push(node)
+    groups.set(node.serviceTitle, list)
+  }
+  return <label className={`field unified-destination-field ${showLabel ? '' : 'is-compact'} ${inlineLatency ? 'is-row' : ''}`}>
+    <span className={showLabel ? 'field-label' : 'sr-only'}>Destination</span>
+    <select aria-label={label} value={destinationValue(destination)} onChange={event => onChange(destinationFromValue(event.target.value))}>
+      <option value="direct">Direct</option>
+      <option value="block">Block</option>
+      {selectedNode?.missing && <option value={`node:${selectedNode.id}`} disabled>{selectedNode.displayName} · Missing</option>}
+      {[...groups].map(([service, serviceNodes]) => <optgroup key={service} label={service}>{serviceNodes.map(node => <option key={node.id} value={`node:${node.id}`}>{node.displayName} · {node.protocol}</option>)}</optgroup>)}
+      {destination.kind === 'node' && !selectedNode && <option value={`node:${destination.nodeId}`} disabled>Unavailable proxy · missing</option>}
+    </select>
+    {selectedNode && <SelectedNodeLatency node={selectedNode} now={now} />}
+  </label>
 }
 
 export function RulesetsPage({ snapshot, onSnapshot, onError }: Props) {
   const { state } = snapshot
+  const now = useNowMs(1000)
   const [selectedId, setSelectedId] = useState<string | null>(state.selection.rulesetId ?? state.rulesets[0]?.id ?? null)
-  const [creatingNew, setCreatingNew] = useState(false)
-  const [draft, setDraft] = useState<RulesetDraft>(() => {
-    const first = state.rulesets.find((ruleset) => ruleset.id === state.selection.rulesetId) ?? state.rulesets[0]
-    return first ? fromRuleset(first) : emptyDraft()
-  })
-  const [busy, setBusy] = useState<string | null>(null)
-  const [groupEditor, setGroupEditor] = useState<MatchGroup | 'new' | null>(null)
-  const [deleteConfirm, setDeleteConfirm] = useState<Ruleset | null>(null)
+  const [draftKey, setDraftKey] = useState<string | null>(null)
+  const [draftKeys, setDraftKeys] = useState<string[]>([])
+  const [draft, setDraft] = useState<Draft>(() => { const r = state.rulesets.find(x => x.id === state.selection.rulesetId) ?? state.rulesets[0]; return r ? fromRuleset(r) : emptyDraft() })
+  const [creating, setCreating] = useState(false)
+  const [expanded, setExpanded] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [importDoc, setImportDoc] = useState<PortableDoc | null>(null)
+  const [proxyMap, setProxyMap] = useState<Record<string, string>>({})
+  const [importName, setImportName] = useState('')
+  const fileRef = useRef<HTMLInputElement>(null)
+  const draftCache = useRef<Record<string, Draft>>({})
 
   useEffect(() => {
-    if (creatingNew) return
-    if (!selectedId || !state.rulesets.some((ruleset) => ruleset.id === selectedId)) {
-      const first = state.rulesets[0]
-      setSelectedId(first?.id ?? null)
-      setDraft(first ? fromRuleset(first) : emptyDraft())
-    }
-  }, [creatingNew, selectedId, state.rulesets])
+    if (!creating && selectedId && !state.rulesets.some(r => r.id === selectedId)) { const first = state.rulesets[0]; setSelectedId(first?.id ?? null); setDraft(first ? fromRuleset(first) : emptyDraft()) }
+  }, [creating, selectedId, state.rulesets])
+  const selected = state.rulesets.find(r => r.id === selectedId)
 
-  const selected = state.rulesets.find((ruleset) => ruleset.id === selectedId)
-  const selectRuleset = (ruleset: Ruleset) => {
-    setCreatingNew(false)
-    setSelectedId(ruleset.id)
-    setDraft(fromRuleset(ruleset))
+  const cacheDraft = () => { draftCache.current[creating ? draftKey ?? '__new__' : selectedId ?? '__new__'] = structuredClone(draft) }
+  const newRuleset = () => { cacheDraft(); const key = `draft-${crypto.randomUUID()}`; draftCache.current[key] = emptyDraft(); setDraftKeys(keys => [...keys, key]); setDraftKey(key); setCreating(true); setSelectedId(null); setDraft(emptyDraft()); setExpanded(null) }
+  const selectRuleset = (id: string) => {
+    if (id.startsWith('draft-')) { cacheDraft(); setCreating(true); setSelectedId(null); setDraftKey(id); setDraft(draftCache.current[id] ?? emptyDraft()); setExpanded(null); return }
+    const r = state.rulesets.find(x => x.id === id); if (!r) return; cacheDraft(); setCreating(false); setSelectedId(id); setDraftKey(null); setDraft(draftCache.current[id] ?? fromRuleset(r)); setExpanded(null)
   }
-
-  const newRuleset = () => {
-    setCreatingNew(true)
-    setSelectedId(null)
-    setDraft(emptyDraft())
-  }
-
-  const run = async (key: string, action: () => Promise<Snapshot>) => {
-    setBusy(key)
+  const changeEntry = (id: string, fn: (e: RulesetEntry) => RulesetEntry) => setDraft(d => ({ ...d, entries: d.entries.map(e => e.id === id ? fn(e) : e) }))
+  const move = (i: number, d: -1 | 1) => setDraft(old => { const entries = [...old.entries]; const j = i + d; if (j < 0 || j >= entries.length) return old; [entries[i], entries[j]] = [entries[j], entries[i]]; return { ...old, entries } })
+  const save = async () => {
+    if (!draft.name.trim()) return onError(new Error('Name the ruleset before saving.'))
+    setBusy(true)
     try {
-      onSnapshot(await action())
-    } catch (error) {
-      try {
-        onSnapshot(await api.getSnapshot())
-      } catch {
-        // The original error is more useful than a refresh failure.
-      }
-      onError(error)
-    } finally {
-      setBusy(null)
-    }
+      const next = await api.saveRuleset({ id: draft.id, name: draft.name, entries: draft.entries, miscellaneous: draft.miscellaneous })
+      onSnapshot(next)
+      const saved = next.state.rulesets.find(r => r.id === draft.id) ?? [...next.state.rulesets].reverse().find(r => r.name === draft.name.trim())
+      if (saved) { delete draftCache.current[draftKey ?? '__new__']; delete draftCache.current[saved.id]; setDraftKeys(keys => keys.filter(key => key !== draftKey)); setCreating(false); setSelectedId(saved.id); setDraftKey(null); setDraft(fromRuleset(saved)) }
+    } catch (e) { onError(e) } finally { setBusy(false) }
   }
-
-  const saveDraft = async () => {
-    if (!draft.name.trim()) {
-      onError(new Error('Name the ruleset before saving.'))
+  const exportDoc = (type: 'rule' | 'ruleset', entry?: RulesetEntry) => {
+    const entries = type === 'rule' && entry ? [entry] : draft.entries
+    if ((type === 'ruleset' && !draft.name.trim()) || entries.some(e => !e.name.trim() || e.conditions.length < 1 || e.conditions.some(c => !validPortableCondition(c.kind, c.value)))) {
+      onError(new Error('Routing files can be exported only when rules and conditions are valid.'))
       return
     }
-    setBusy('save')
-    try {
-      const next = await api.saveRuleset({
-        id: draft.id,
-        name: draft.name,
-        entries: draft.entries,
-        miscellaneous: draft.miscellaneous,
-      })
-      onSnapshot(next)
-      const saved =
-        next.state.rulesets.find((ruleset) => ruleset.id === draft.id) ??
-        [...next.state.rulesets].reverse().find((ruleset) => ruleset.name === draft.name.trim())
-      if (saved) {
-        setCreatingNew(false)
-        setSelectedId(saved.id)
-        setDraft(fromRuleset(saved))
-      }
-    } catch (error) {
-      try {
-        onSnapshot(await api.getSnapshot())
-      } catch {
-        // Keep the original failure visible.
-      }
-      onError(error)
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  const addEntry = (groupId: string) => {
-    if (!groupId) return
-    setDraft((current) => ({
-      ...current,
-      entries: [
-        ...current.entries,
-        {
-          id: `local_${Date.now()}`,
-          matchGroupId: groupId,
-          destination: { kind: 'direct' },
-        },
-      ],
-    }))
-  }
-
-  const updateEntry = (entryId: string, update: Partial<RulesetEntry>) => {
-    setDraft((current) => ({
-      ...current,
-      entries: current.entries.map((entry) => (entry.id === entryId ? { ...entry, ...update } : entry)),
-    }))
-  }
-
-  const moveEntry = (index: number, direction: -1 | 1) => {
-    setDraft((current) => {
-      const next = [...current.entries]
-      const target = index + direction
-      if (target < 0 || target >= next.length) return current
-      ;[next[index], next[target]] = [next[target], next[index]]
-      return { ...current, entries: next }
+    const refs = new Map<string, string>()
+    const rules: PortableRule[] = entries.map(e => {
+      let destination: PortableDestination
+      if (e.destination.kind === 'node') {
+        const nodeId = e.destination.nodeId
+        const node = state.nodes.find(n => n.id === nodeId)
+        const ref = refs.get(nodeId) ?? `proxy-${refs.size + 1}`
+        refs.set(nodeId, ref)
+        destination = { kind: 'proxy', proxyRef: ref, label: `Proxy ${Number(ref.slice(6)) || 1}${node ? ` · ${node.protocol}` : ''}` }
+      } else destination = { kind: e.destination.kind }
+      return { name: e.name, conditions: e.conditions.map(({ kind, value }) => ({ kind, value })), destination }
     })
+    let miscellaneous: PortableDoc['miscellaneous']
+    if (draft.miscellaneous.kind === 'node') miscellaneous = portableDestination(draft.miscellaneous.nodeId, state.nodes, refs)
+    else miscellaneous = draft.miscellaneous.kind
+    const doc: PortableDoc = { format: 'clashfork-routing', version: 1, type, ...(type === 'ruleset' ? { name: draft.name, rules, miscellaneous } : { rule: rules[0] }) }
+    const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `clashfork-${type}.json`; a.click(); URL.revokeObjectURL(url)
   }
-
-  const unusedGroups = state.matchGroups.filter(
-    (group) => !draft.entries.some((entry) => entry.matchGroupId === group.id),
-  )
-
-  return (
-    <div>
-      <PageHeader
-        title="Rulesets"
-        actions={
-          <>
-            <Button variant="secondary" icon="plus" onClick={() => setGroupEditor('new')}>
-              New match group
-            </Button>
-            <Button variant="primary" onClick={newRuleset}>
-              New ruleset
-            </Button>
-          </>
-        }
-      />
-
-      <Grid className="rulesets-layout">
-        <GridItem span={3}>
-        <Panel className="ruleset-index" aria-label="Rulesets">
-          {state.rulesets.length === 0 ? (
-            <p className="muted index-empty">No rulesets yet.</p>
-          ) : (
-            <ul>
-              {state.rulesets.map((ruleset) => (
-                <li key={ruleset.id}>
-                  <button
-                    type="button"
-                    className={selectedId === ruleset.id ? 'is-active' : ''}
-                    aria-current={selectedId === ruleset.id ? 'true' : undefined}
-                    onClick={() => selectRuleset(ruleset)}
-                  >
-                    <span>{ruleset.name}</span>
-                    {state.selection.rulesetId === ruleset.id ? <SourceBadge tone="accent">Active</SourceBadge> : null}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </Panel>
-        </GridItem>
-
-        <GridItem span={9}>
-        <Panel className="ruleset-detail">
-          {!creatingNew && selected == null && !draft.name && draft.entries.length === 0 ? (
-            <EmptyState
-              title="Create a ruleset"
-              description="Group match conditions into destinations, then pick the ruleset on the Dashboard. The final Miscellaneous row is always last."
-              action={<Button variant="primary" onClick={newRuleset}>New ruleset</Button>}
-            />
-          ) : (
-            <>
-              <div className="ruleset-detail-head">
-                <div className="ruleset-title-field">
-                  <label htmlFor="ruleset-name" className="sr-only">Ruleset name</label>
-                  <input
-                    id="ruleset-name"
-                    value={draft.name}
-                    maxLength={80}
-                    placeholder="Ruleset name"
-                    onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                  />
-                  {state.selection.rulesetId === draft.id ? <SourceBadge tone="accent">Active</SourceBadge> : null}
-                </div>
-                <div className="ruleset-actions">
-                  {draft.id ? (
-                    <IconButton
-                      icon="trash"
-                      label="Delete ruleset"
-                      disabled={busy !== null || state.selection.rulesetId === draft.id}
-                      onClick={() => selected && setDeleteConfirm(selected)}
-                    />
-                  ) : null}
-                  <Button variant="primary" busy={busy === 'save'} disabled={busy !== null} onClick={() => void saveDraft()}>
-                    Save ruleset
-                  </Button>
-                </div>
-              </div>
-
-              <div className="rules-table" role="table" aria-label="Ruleset entries">
-                <div className="rules-table-head" role="row">
-                  <span role="columnheader">Group</span>
-                  <span role="columnheader">Action</span>
-                  <span role="columnheader">Destination</span>
-                  <span className="sr-only" role="columnheader">Order</span>
-                </div>
-                {draft.entries.length === 0 ? (
-                  <div className="rules-empty">Add a match group to this ruleset. All conditions in a group are OR; the first matching group wins.</div>
-                ) : null}
-                {draft.entries.map((entry, index) => {
-                  const group = state.matchGroups.find((candidate) => candidate.id === entry.matchGroupId)
-                  return (
-                    <div className="rules-row" role="row" key={entry.id}>
-                      <div className="rules-cell" role="cell">
-                        <strong>{group?.name ?? 'Missing group'}</strong>
-                        <span>{group?.conditions.map((condition) => `${conditionLabels[condition.kind]}: ${condition.value}`).join(' · ') || ''}</span>
-                      </div>
-                      <div className="rules-cell" role="cell">
-                        <select
-                          aria-label={`Action for ${group?.name ?? 'group'}`}
-                          value={entry.destination.kind}
-                          onChange={(event) => {
-                            const kind = event.target.value
-                            const destination: Destination =
-                              kind === 'direct'
-                                ? { kind: 'direct' }
-                                : kind === 'block'
-                                  ? { kind: 'block' }
-                                  : { kind: 'node', nodeId: firstAvailableNode(state)?.id ?? '' }
-                            updateEntry(entry.id, { destination })
-                          }}
-                        >
-                          <option value="direct">Direct</option>
-                          <option value="block">Block</option>
-                          <option value="node">Node</option>
-                        </select>
-                      </div>
-                      <div className="rules-cell" role="cell">
-                        {entry.destination.kind === 'node' ? (
-                          <select
-                            aria-label={`Node destination for ${group?.name ?? 'group'}`}
-                            value={entry.destination.nodeId}
-                            onChange={(event) =>
-                              updateEntry(entry.id, {
-                                destination: { kind: 'node', nodeId: event.target.value },
-                              })
-                            }
-                          >
-                            <option value="">Select node</option>
-                            {groupNodes(state.nodes).map(([service, nodes]) => (
-                              <optgroup key={service} label={service}>
-                                {nodes.filter((node) => !node.missing).map((node) => (
-                                  <option key={node.id} value={node.id}>{node.displayName} · {node.protocol}</option>
-                                ))}
-                              </optgroup>
-                            ))}
-                          </select>
-                        ) : (
-                          <span className="muted">{entry.destination.kind === 'block' ? 'Rejected before proxying' : 'Out of tunnel'}</span>
-                        )}
-                      </div>
-                      <div className="order-buttons" role="cell">
-                        <IconButton icon="arrow-up" label="Move group up" disabled={index === 0} onClick={() => moveEntry(index, -1)} />
-                        <IconButton icon="arrow-down" label="Move group down" disabled={index === draft.entries.length - 1} onClick={() => moveEntry(index, 1)} />
-                        <IconButton
-                          icon="close"
-                          label="Remove group from ruleset"
-                          onClick={() =>
-                            setDraft((current) => ({
-                              ...current,
-                              entries: current.entries.filter((candidate) => candidate.id !== entry.id),
-                            }))
-                          }
-                        />
-                      </div>
-                    </div>
-                  )
-                })}
-                <div className="rules-row rules-row-fixed" role="row">
-                  <div className="rules-cell" role="cell"><strong>Miscellaneous</strong><span>Final catch-all</span></div>
-                  <div className="rules-cell" role="cell">
-                    <select
-                      aria-label="Miscellaneous action"
-                      value={draft.miscellaneous}
-                      onChange={(event) => setDraft({ ...draft, miscellaneous: event.target.value as 'direct' | 'block' })}
-                    >
-                      <option value="direct">Direct</option>
-                      <option value="block">Block</option>
-                    </select>
-                  </div>
-                  <div className="rules-cell" role="cell"><span className="muted">Always last</span></div>
-                  <div />
-                </div>
-              </div>
-
-              <div className="add-group-row">
-                <label>
-                  <span className="sr-only">Add match group to ruleset</span>
-                  <select value="" disabled={unusedGroups.length === 0} onChange={(event) => addEntry(event.target.value)}>
-                    <option value="">{unusedGroups.length === 0 ? 'All match groups added' : 'Add match group…'}</option>
-                    {unusedGroups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
-                  </select>
-                </label>
-                <span className="field-hint">First match wins. OR applies within a group.</span>
-              </div>
-
-              <div className="match-groups-head">
-                <div>
-                  <h2>Match groups</h2>
-                  <p>Each group is OR across its conditions and reusable across rulesets.</p>
-                </div>
-                <Button variant="secondary" icon="plus" onClick={() => setGroupEditor('new')}>New match group</Button>
-              </div>
-              <div className="match-groups">
-                {state.matchGroups.length === 0 ? <p className="muted">Create a match group to begin.</p> : null}
-                {state.matchGroups.map((group) => (
-                  <article className="match-group-card" key={group.id}>
-                    <header>
-                      <h3>{group.name}</h3>
-                      <div>
-                        <IconButton icon="edit" label={`Edit ${group.name}`} onClick={() => setGroupEditor(group)} />
-                        <IconButton
-                          icon="trash"
-                          label={`Delete ${group.name}`}
-                          disabled={state.rulesets.some((ruleset) => ruleset.entries.some((entry) => entry.matchGroupId === group.id))}
-                          onClick={() => void run(`delete-group-${group.id}`, () => api.deleteMatchGroup(group.id))}
-                        />
-                      </div>
-                    </header>
-                    <ul>
-                      {group.conditions.map((condition) => (
-                        <li key={condition.id}>
-                          <span>{conditionLabels[condition.kind]}</span>
-                          <code>{condition.value}</code>
-                        </li>
-                      ))}
-                    </ul>
-                  </article>
-                ))}
-              </div>
-            </>
-          )}
-        </Panel>
-        </GridItem>
-      </Grid>
-
-      {groupEditor ? (
-        <MatchGroupEditor
-          group={groupEditor === 'new' ? null : groupEditor}
-          busy={busy === 'group'}
-          onClose={() => setGroupEditor(null)}
-          onSave={async (input) => {
-            setBusy('group')
-            try {
-              onSnapshot(await api.saveMatchGroup(input))
-              setGroupEditor(null)
-            } catch (error) {
-              onError(error)
-            } finally {
-              setBusy(null)
-            }
-          }}
-        />
-      ) : null}
-
-      {deleteConfirm ? (
-        <Modal
-          title="Delete ruleset"
-          description={`Delete “${deleteConfirm.name}”? This cannot be undone.`}
-          onClose={() => setDeleteConfirm(null)}
-          footer={
-            <>
-              <Button onClick={() => setDeleteConfirm(null)}>Cancel</Button>
-              <Button
-                variant="danger"
-                busy={busy === 'delete'}
-                onClick={() => {
-                  void run('delete', async () => {
-                    const next = await api.deleteRuleset(deleteConfirm.id)
-                    setDeleteConfirm(null)
-                    setCreatingNew(false)
-                    setSelectedId(null)
-                    setDraft(emptyDraft())
-                    return next
-                  })
-                }}
-              >
-                Delete ruleset
-              </Button>
-            </>
-          }
-        >
-          <p>The active ruleset and rulesets referenced by a saved run configuration cannot be deleted.</p>
-        </Modal>
-      ) : null}
-    </div>
-  )
-}
-
-function fromRuleset(ruleset: Ruleset): RulesetDraft {
-  return {
-    id: ruleset.id,
-    name: ruleset.name,
-    entries: structuredClone(ruleset.entries),
-    miscellaneous: ruleset.miscellaneous,
-  }
-}
-
-function firstAvailableNode(state: Snapshot['state']) {
-  return state.nodes.find((node) => !node.missing)
-}
-
-function groupNodes(nodes: Snapshot['state']['nodes']): Array<[string, Snapshot['state']['nodes']]> {
-  const map = new Map<string, Snapshot['state']['nodes']>()
-  for (const node of nodes) {
-    const list = map.get(node.serviceTitle) ?? []
-    list.push(node)
-    map.set(node.serviceTitle, list)
-  }
-  return [...map.entries()]
-}
-
-function MatchGroupEditor({
-  group,
-  busy,
-  onClose,
-  onSave,
-}: {
-  group: MatchGroup | null
-  busy: boolean
-  onClose: () => void
-  onSave: (input: {
-    id: string | null
-    name: string
-    conditions: Array<{ kind: ConditionKind; value: string }>
-  }) => Promise<void>
-}) {
-  const [name, setName] = useState(group?.name ?? '')
-  const [conditions, setConditions] = useState(
-    group?.conditions.map((condition) => ({ kind: condition.kind, value: condition.value })) ?? [
-      { kind: 'process_name' as ConditionKind, value: '' },
-    ],
-  )
-
-  return (
-    <Modal
-      title={group ? 'Edit match group' : 'New match group'}
-      description="Conditions within this group are OR: any one match routes to the group's destination."
-      onClose={onClose}
-      wide
-      footer={
-        <>
-          <Button onClick={onClose}>Cancel</Button>
-          <Button
-            variant="primary"
-            busy={busy}
-            onClick={() => void onSave({ id: group?.id ?? null, name, conditions })}
-          >
-            Save match group
-          </Button>
-        </>
+  const readFile = async (file?: File) => {
+    if (!file) return
+    try {
+      if (file.size > 1_000_000) throw new Error('Routing files must be under 1 MB.')
+      const d = JSON.parse(await file.text()) as PortableDoc
+      if (d.format !== 'clashfork-routing' || d.version !== 1 || !['rule', 'ruleset'].includes(d.type)) throw new Error('Unsupported routing file format or version.')
+      const rules = (d.type === 'rule' ? (d.rule ? [d.rule] : []) : d.rules) as PortableRule[] | undefined
+      if (!Array.isArray(rules) || rules.length > 200 || (d.type === 'rule' && rules.length !== 1)) throw new Error('The file must contain 1–200 rules.')
+      for (const r of rules) {
+        if (!r || typeof r.name !== 'string' || !r.name.trim() || r.name.length > 80 || !Array.isArray(r.conditions) || r.conditions.length < 1 || r.conditions.length > 50) throw new Error('Each rule needs a name and 1–50 conditions.')
+        if (r.conditions.some(c => !Object.hasOwn(kinds, c.kind) || typeof c.value !== 'string' || !validPortableCondition(c.kind, c.value))) throw new Error('The file contains an invalid condition value.')
+        const distinctConditions = new Set(r.conditions.map(c => `${c.kind}:${c.value.trim().toLowerCase()}`))
+        if (distinctConditions.size !== r.conditions.length) throw new Error('A rule cannot repeat the same condition.')
+        const dest = r.destination
+        if (!dest || !['direct', 'block', 'proxy'].includes(dest.kind) || (dest.kind === 'proxy' && (typeof dest.proxyRef !== 'string' || !/^proxy-[A-Za-z0-9_-]{1,58}$/.test(dest.proxyRef) || typeof dest.label !== 'string' || !dest.label.trim() || dest.label.length > 100))) throw new Error('The file contains an invalid destination.')
       }
-    >
-      <Field label="Group name">
-        <input data-autofocus value={name} maxLength={80} placeholder="OpenAI" onChange={(event) => setName(event.target.value)} />
-      </Field>
-      <div className="condition-editor">
-        <div className="condition-editor-head"><span>Conditions</span><span>Any match</span></div>
-        {conditions.map((condition, index) => (
-          <div className="condition-row" key={index}>
-            <select
-              aria-label={`Condition ${index + 1} type`}
-              value={condition.kind}
-              onChange={(event) =>
-                setConditions((current) =>
-                  current.map((item, itemIndex) =>
-                    itemIndex === index ? { ...item, kind: event.target.value as ConditionKind } : item,
-                  ),
-                )
-              }
-            >
-              {Object.entries(conditionLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-            </select>
-            <input
-              aria-label={`Condition ${index + 1} value`}
-              value={condition.value}
-              placeholder={placeholderFor(condition.kind)}
-              onChange={(event) =>
-                setConditions((current) =>
-                  current.map((item, itemIndex) =>
-                    itemIndex === index ? { ...item, value: event.target.value } : item,
-                  ),
-                )
-              }
-            />
-            <IconButton
-              icon="trash"
-              label={`Remove condition ${index + 1}`}
-              disabled={conditions.length === 1}
-              onClick={() => setConditions((current) => current.filter((_, itemIndex) => itemIndex !== index))}
-            />
-          </div>
-        ))}
-        <Button variant="quiet" icon="plus" onClick={() => setConditions((current) => [...current, { kind: 'domain_suffix', value: '' }])}>
-          Add condition
-        </Button>
-      </div>
-    </Modal>
-  )
-}
-
-function placeholderFor(kind: ConditionKind): string {
-  switch (kind) {
-    case 'process_name': return 'ChatGPT.exe'
-    case 'process_path': return 'C:\\Program Files\\App\\app.exe'
-    case 'domain': return 'example.com'
-    case 'domain_suffix': return 'chatgpt.com'
-    case 'ipv4_cidr': return '203.0.113.0/24'
-    case 'ipv6_cidr': return '2001:db8::/32'
+      if (d.type === 'ruleset') {
+        const misc = d.miscellaneous
+        if (typeof d.name !== 'string' || !d.name.trim() || d.name.length > 80 || !misc || (typeof misc === 'string' ? !['direct', 'block'].includes(misc) : misc.kind !== 'proxy' || typeof misc.proxyRef !== 'string' || !/^proxy-[A-Za-z0-9_-]{1,58}$/.test(misc.proxyRef) || typeof misc.label !== 'string' || !misc.label.trim() || misc.label.length > 100)) throw new Error('The ruleset name or catch-all is invalid.')
+      }
+      const map: Record<string, string> = {}
+      for (const r of rules) if (r.destination.kind === 'proxy') map[r.destination.proxyRef] ??= ''
+      if (d.type === 'ruleset' && typeof d.miscellaneous === 'object' && d.miscellaneous.kind === 'proxy') map[d.miscellaneous.proxyRef] ??= ''
+      setProxyMap(map)
+      const base = d.type === 'ruleset' ? d.name || 'Imported ruleset' : draft.name || 'Imported ruleset'
+      const usedNames = new Set([
+        ...state.rulesets.map(r => r.name.toLowerCase()),
+        ...draftKeys.map(key => draftCache.current[key]?.name.toLowerCase()).filter((name): name is string => Boolean(name)),
+        draft.name.toLowerCase(),
+      ])
+      let candidate = base
+      if (usedNames.has(candidate.toLowerCase())) {
+        candidate = `${base} (imported)`
+        let suffix = 2
+        while (usedNames.has(candidate.toLowerCase())) candidate = `${base} (imported ${suffix++})`
+      }
+      setImportName(candidate)
+      setImportDoc(d)
+    } catch (e) { onError(e) }
   }
+  const proxyRefs = Object.keys(proxyMap)
+  const importRules = importDoc ? (importDoc.type === 'rule' ? [importDoc.rule!] : importDoc.rules!) : []
+  const acceptImport = () => {
+    if (!importDoc || proxyRefs.some(ref => !proxyMap[ref])) return
+    const entries = importRules.map(rule => {
+      const destination = rule.destination.kind === 'proxy'
+        ? { kind: 'node' as const, nodeId: proxyMap[rule.destination.proxyRef] }
+        : { kind: rule.destination.kind }
+      return {
+        ...entryFrom(rule.name, rule.conditions.map(condition => makeCondition(condition.kind, condition.value))),
+        destination,
+      }
+    })
+
+    if (importDoc.type === 'rule') {
+      setDraft(current => ({ ...current, entries: [...current.entries, ...entries] }))
+      setExpanded(entries[0]?.id ?? null)
+    } else {
+      cacheDraft()
+      const key = `draft-${crypto.randomUUID()}`
+      const importedMiscellaneous = importDoc.miscellaneous
+      const miscellaneous = typeof importedMiscellaneous === 'object' && importedMiscellaneous.kind === 'proxy'
+        ? { kind: 'node' as const, nodeId: proxyMap[importedMiscellaneous.proxyRef] }
+        : { kind: typeof importedMiscellaneous === 'string' ? importedMiscellaneous : 'direct' as const }
+      const importedDraft = { id: null, name: importName, entries, miscellaneous }
+
+      draftCache.current[key] = importedDraft
+      setDraftKeys(keys => [...keys, key])
+      setDraftKey(key)
+      setDraft(importedDraft)
+      setCreating(true)
+      setSelectedId(null)
+      setExpanded(null)
+    }
+    setImportDoc(null)
+  }
+
+  const importDescription = proxyRefs.length > 0
+    ? 'Choose local nodes for the proxy destinations. Save the draft to apply it.'
+    : 'Save the draft to apply it.'
+
+  return <div className="rulesets-page">
+    <PageHeader title="Rulesets" actions={<Button variant="primary" onClick={newRuleset}>New ruleset</Button>} />
+    <Panel className="unified-rules-panel">
+      <Toolbar className="unified-rules-toolbar">
+        <Field label="Ruleset" className="unified-rules-select"><select aria-label="Ruleset" value={creating ? draftKey ?? '' : selectedId ?? ''} onChange={e => e.target.value && selectRuleset(e.target.value)}>
+          {!state.rulesets.length && !creating && draftKeys.length === 0 && <option value="">No rulesets yet</option>}
+          {state.rulesets.map(r => <option key={r.id} value={r.id}>{r.name}{state.selection.rulesetId === r.id ? ' · Active' : ''}</option>)}
+          {draftKeys.map(key => <option key={key} value={key}>{draftCache.current[key]?.name || 'New ruleset'} · Draft</option>)}
+        </select></Field>
+        <div className="unified-file-actions"><input ref={fileRef} className="sr-only" type="file" accept=".json,application/json" aria-label="Import routing JSON" onChange={e => { void readFile(e.target.files?.[0]); e.currentTarget.value = '' }} /><Button onClick={() => fileRef.current?.click()}>Import JSON</Button><Button onClick={() => exportDoc('ruleset')} disabled={!draft.name}>Export ruleset</Button></div>
+      </Toolbar>
+      {!creating && !selected && !draft.name ? <EmptyState title="No rulesets yet" description="Create a ruleset to route apps and domains." /> : <>
+        <div className="unified-rules-head"><input aria-label="Ruleset name" maxLength={80} placeholder="Ruleset name" value={draft.name} onChange={e => setDraft(d => ({ ...d, name: e.target.value }))} /><span className="unified-spacer"/><Button onClick={() => setDraft(selected ? fromRuleset(selected) : emptyDraft())}>Undo</Button><Button variant="primary" busy={busy} onClick={() => void save()}>Save</Button></div>
+        <div className="unified-rules-list" aria-label="Rules">
+          {draft.entries.map((entry, i) => {
+            const destination = entry.destination
+            const isOpen = expanded === entry.id
+            return <article className={`unified-rule ${isOpen ? 'is-expanded' : ''}`} key={entry.id}>
+              <div className="unified-rule-summary">
+                <button className="unified-rule-expand" aria-expanded={isOpen} onClick={() => setExpanded(isOpen ? null : entry.id)}>
+                  <span className="unified-rule-name">{entry.name || 'Untitled rule'}</span>
+                </button>
+                <DestinationPicker
+                  destination={destination}
+                  nodes={state.nodes}
+                  label={`Destination for ${entry.name || 'rule'}`}
+                  showLabel={false}
+                  inlineLatency
+                  now={now}
+                  onChange={nextDestination => changeEntry(entry.id, current => ({ ...current, destination: nextDestination }))}
+                />
+                <div className="unified-rule-actions">
+                  <IconButton icon="arrow-up" label="Move rule up" disabled={i === 0} onClick={() => move(i, -1)} />
+                  <IconButton icon="arrow-down" label="Move rule down" disabled={i === draft.entries.length - 1} onClick={() => move(i, 1)} />
+                  <IconButton icon="download" label="Export rule" onClick={() => exportDoc('rule', entry)} />
+                  <IconButton icon="close" label="Remove rule" onClick={() => setDraft(current => ({ ...current, entries: current.entries.filter(item => item.id !== entry.id) }))} />
+                </div>
+              </div>
+              {isOpen && <div className="unified-rule-editor"><div className="unified-edit-top"><Field label="Rule name"><input value={entry.name} maxLength={80} onChange={e => changeEntry(entry.id, x => ({ ...x, name: e.target.value }))} /></Field></div>
+                <div className="unified-condition-list">{entry.conditions.map((c, ci) => <div className="unified-condition" key={c.id}><select aria-label={`Condition ${ci + 1} type`} value={c.kind} onChange={e => changeEntry(entry.id, x => ({ ...x, conditions: x.conditions.map((v,j) => j===ci ? { ...v, kind: e.target.value as ConditionKind } : v) }))}>{Object.entries(kinds).map(([k,l]) => <option key={k} value={k}>{l}</option>)}</select><input aria-label={`Condition ${ci + 1} value`} value={c.value} onChange={e => changeEntry(entry.id, x => ({ ...x, conditions: x.conditions.map((v,j) => j===ci ? { ...v, value: e.target.value } : v) }))} /><IconButton icon="close" label={`Remove condition ${ci + 1}`} disabled={entry.conditions.length <= 1} onClick={() => changeEntry(entry.id, x => ({ ...x, conditions: x.conditions.filter((_,j) => j!==ci) }))} /></div>)}</div>
+                <div className="unified-condition-tools"><Button onClick={() => changeEntry(entry.id, x => ({ ...x, conditions: [...x.conditions, makeCondition()] }))}>Add condition</Button></div>
+              </div>}
+            </article>
+          })}
+          <article className="unified-rule catchall"><div className="unified-rule-summary"><span className="unified-rule-name">Everything else</span><DestinationPicker destination={draft.miscellaneous} nodes={state.nodes} label="Everything else destination" showLabel={false} now={now} onChange={miscellaneous => setDraft(d => ({ ...d, miscellaneous }))} /></div></article>
+        </div>
+        <div className="unified-rules-bottom"><Button onClick={() => { const e=entryFrom(`Rule ${draft.entries.length+1}`); setDraft(d => ({ ...d, entries: [...d.entries,e] })); setExpanded(e.id) }}>Add rule</Button></div>
+      </>}
+    </Panel>
+    {importDoc && <Modal title={`Import ${importDoc.type}`} description={importDescription} onClose={() => setImportDoc(null)} wide footer={<><Button onClick={() => setImportDoc(null)}>Cancel import</Button><Button variant="primary" disabled={proxyRefs.some(ref => !proxyMap[ref])} onClick={acceptImport}>Use imported draft</Button></>}>
+      {importDoc.type === 'ruleset' && <Field label="Ruleset name"><input value={importName} maxLength={80} onChange={e => setImportName(e.target.value)} /></Field>}
+      <p className="field-hint">{importRules.length} rule{importRules.length===1?'':'s'} · {importRules.reduce((n,r)=>n+r.conditions.length,0)} condition{importRules.reduce((n,r)=>n+r.conditions.length,0)===1?'':'s'} · Everything else: {typeof importDoc.miscellaneous === 'string' ? importDoc.miscellaneous : importDoc.miscellaneous?.kind === 'proxy' ? importDoc.miscellaneous.label : 'unchanged'}</p>
+      {proxyRefs.map(ref => {
+        const ruleDestination = importRules.find(rule => (
+          rule.destination.kind === 'proxy' && rule.destination.proxyRef === ref
+        ))?.destination
+        const fallbackDestination = importDoc.miscellaneous
+        const mappedFallback = typeof fallbackDestination === 'object'
+          && fallbackDestination.kind === 'proxy'
+          && fallbackDestination.proxyRef === ref
+          ? fallbackDestination
+          : undefined
+        const label = ruleDestination?.kind === 'proxy'
+          ? ruleDestination.label
+          : mappedFallback?.label
+
+        return (
+          <Field key={ref} label={`Map “${label ?? ref}” to local node`}>
+            <select
+              value={proxyMap[ref]}
+              onChange={event => setProxyMap(current => ({ ...current, [ref]: event.target.value }))}
+            >
+              <option value="">Choose a node</option>
+              {state.services.map(service => (
+                <optgroup key={service.id} label={service.title}>
+                  {state.nodes
+                    .filter(node => node.serviceId === service.id && !node.missing)
+                    .map(node => (
+                      <option key={node.id} value={node.id}>
+                        {node.displayName} · {node.protocol}
+                      </option>
+                    ))}
+                </optgroup>
+              ))}
+            </select>
+          </Field>
+        )
+      })}
+      <div className="import-rule-preview">{importRules.map((r,i)=><div key={i}><strong>{r.name}</strong><span>{r.conditions.length} condition{r.conditions.length===1?'':'s'} → {r.destination.kind === 'proxy' ? r.destination.label : r.destination.kind}</span></div>)}</div>
+    </Modal>}
+  </div>
 }

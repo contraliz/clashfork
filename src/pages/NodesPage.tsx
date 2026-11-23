@@ -1,8 +1,10 @@
-import { useMemo, useState } from 'react'
-import { api } from '../api'
-import type { ImportPreview, Snapshot, SourceType } from '../types'
+import { useEffect, useMemo, useState } from 'react'
+import { api, subscribeNodeTestProgress } from '../api'
+import type { ImportPreview, NodeTestProgress, Snapshot, SourceType } from '../types'
 import { allowanceProgress, allowanceSummary, formatBytes, formatDate, formatExpiry } from '../lib/format'
 import { Icon } from '../components/Icon'
+import { LatencyValue } from '../components/NodeLatency'
+import { useNowMs } from '../hooks'
 import {
   Button,
   EmptyState,
@@ -24,6 +26,7 @@ interface Props {
 
 export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
   const { state } = snapshot
+  const now = useNowMs(1000)
   const [search, setSearch] = useState('')
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   const [addOpen, setAddOpen] = useState(false)
@@ -31,7 +34,37 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
   const [preview, setPreview] = useState<ImportPreview | null>(null)
   const [title, setTitle] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
+  const [testingNodeId, setTestingNodeId] = useState<string | null>(null)
+  const [testingAll, setTestingAll] = useState(false)
+  const [sweepProgress, setSweepProgress] = useState<NodeTestProgress | null>(null)
+  const [testFeedback, setTestFeedback] = useState<Record<string, string>>({})
+  const [sweepFeedback, setSweepFeedback] = useState('')
   const [renameService, setRenameService] = useState<{ id: string; title: string } | null>(null)
+
+  useEffect(() => {
+    let mounted = true
+    let unlisten: (() => void) | null = null
+    void subscribeNodeTestProgress((progress) => {
+      if (!mounted) return
+      setSweepProgress(progress)
+      if (progress.nodeId) {
+        setTestFeedback((current) => {
+          const next = { ...current }
+          if (progress.latencyMs == null) next[progress.nodeId!] = 'No response'
+          else delete next[progress.nodeId!]
+          return next
+        })
+      }
+      if (progress.finished) setTestingAll(false)
+    }).then((stop) => {
+      if (!mounted) stop?.()
+      else unlisten = stop
+    })
+    return () => {
+      mounted = false
+      unlisten?.()
+    }
+  }, [])
 
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase()
@@ -94,9 +127,32 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
       <PageHeader
         title="Nodes"
         actions={
-          <Button variant="primary" icon="plus" onClick={() => setAddOpen(true)}>
-            Add Nodes
-          </Button>
+          <div className="nodes-header-actions">
+            <Button
+              variant="secondary"
+              busy={testingAll}
+              disabled={!snapshot.runtime.vpnActive || !state.nodes.some((node) => !node.missing)}
+              onClick={() => {
+                setTestingAll(true)
+                setSweepFeedback('')
+                void api.testAllNodes().then(async (summary) => {
+                  onSnapshot(await api.getSnapshot())
+                  if (summary.cancelled) setSweepFeedback(`Stopped · ${summary.responded} of ${summary.total} responded`)
+                  else setSweepFeedback(`${summary.responded} of ${summary.total} responded`)
+                  setTestingAll(false)
+                }).catch((error: unknown) => {
+                  setSweepFeedback(nodeTestFailureText(error))
+                  setTestingAll(false)
+                })
+              }}
+              title={snapshot.runtime.vpnActive ? 'Test available nodes one at a time per route, up to four in parallel' : 'Connect Clashfork to test node latency'}
+            >
+              Test all nodes
+            </Button>
+            <Button variant="primary" icon="plus" onClick={() => setAddOpen(true)}>
+              Add Nodes
+            </Button>
+          </div>
         }
       />
 
@@ -112,6 +168,20 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
         </label>
         <span className="toolbar-meta">{filtered.length} {filtered.length === 1 ? 'node' : 'nodes'}</span>
       </Toolbar>
+      {testingAll && sweepProgress ? (
+        <Toolbar className="node-test-progress" role="status" aria-live="polite">
+          <span>Testing {sweepProgress.completed} of {sweepProgress.total}</span>
+          <span>{sweepProgress.responded} responded</span>
+          {sweepProgress.failed > 0 ? <span>{sweepProgress.failed} no response</span> : null}
+          <Button variant="quiet" onClick={() => void api.cancelNodeTestSweep()}>
+            Cancel
+          </Button>
+        </Toolbar>
+      ) : null}
+      {!snapshot.runtime.vpnActive ? (
+        <p className="node-test-hint">Connect Clashfork to test node latency.</p>
+      ) : null}
+      {!testingAll && sweepFeedback ? <p className="node-test-hint" role="status">{sweepFeedback}</p> : null}
 
       {state.services.length === 0 ? (
         <Panel>
@@ -129,6 +199,7 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
         <div className="service-stack">
           {state.services.map((service) => {
             const nodes = filtered.filter((node) => node.serviceId === service.id)
+            const hasAvailableNodes = state.nodes.some((node) => node.serviceId === service.id && !node.missing)
             const isCollapsed = collapsed[service.id]
             const progress = allowanceProgress(service.allowance)
             return (
@@ -151,7 +222,8 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
                       ) : (
                         <SourceBadge>Manual</SourceBadge>
                       )}
-                      {service.stale ? <SourceBadge tone="amber">Stale</SourceBadge> : null}
+                      {service.stale && !hasAvailableNodes ? <SourceBadge tone="red">Unavailable</SourceBadge> : null}
+                      {service.omittedNodeIds.length > 0 ? <SourceBadge tone="amber">Omitted once</SourceBadge> : null}
                     </div>
                     <div className="service-meta">
                       <span>{service.nodeCount} {service.nodeCount === 1 ? 'node' : 'nodes'}</span>
@@ -189,6 +261,9 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
                   </div>
                 ) : null}
                 {service.lastError ? <p className="service-error">{service.lastError}</p> : null}
+                {snapshot.runtime.pendingReconnectServices.includes(service.id) ? (
+                  <p className="service-refresh-notice">A selected node was refreshed. The running session keeps its existing endpoint until reconnect.</p>
+                ) : null}
                 {!isCollapsed ? (
                   <div className="node-table-wrap">
                     {nodes.length === 0 ? (
@@ -199,17 +274,51 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
                           <tr>
                             <th scope="col">Node</th>
                             <th scope="col">Protocol</th>
+                            <th scope="col">Latency</th>
                             <th scope="col">State</th>
                           </tr>
                         </thead>
                         <tbody>
                           {nodes.map((node) => (
-                            <tr key={node.id} className={node.missing ? 'is-missing' : ''}>
+                            <tr key={node.id} data-node-id={node.id} className={node.missing ? 'is-missing' : ''}>
                               <td><strong>{node.displayName}</strong></td>
                               <td>{node.protocol}</td>
                               <td>
+                                <div className="node-latency-cell">
+                                  <LatencyValue node={node} now={now} />
+                                  {testFeedback[node.id] ? (
+                                    <span className="node-test-feedback" role="status">{testFeedback[node.id]}</span>
+                                  ) : null}
+                                  {!node.missing ? (
+                                    <Button
+                                      variant="quiet"
+                                      className="node-test-button"
+                                      busy={testingNodeId === node.id}
+                                      disabled={!snapshot.runtime.vpnActive || testingNodeId !== null || testingAll || busy !== null}
+                                      aria-label={`Test ${node.displayName} latency`}
+                                      title={snapshot.runtime.vpnActive ? `Test ${node.displayName} latency` : 'Connect Clashfork to test node latency'}
+                                      onClick={() => {
+                                        setTestingNodeId(node.id)
+                                        setTestFeedback((current) => {
+                                          const next = { ...current }
+                                          delete next[node.id]
+                                          return next
+                                        })
+                                        void api.testNode(node.id).then(onSnapshot).catch((error: unknown) => {
+                                          setTestFeedback((current) => ({ ...current, [node.id]: nodeTestFailureText(error) }))
+                                        }).finally(() => setTestingNodeId(null))
+                                      }}
+                                    >
+                                      Test
+                                    </Button>
+                                  ) : null}
+                                </div>
+                              </td>
+                              <td>
                                 {node.missing ? (
                                   <SourceBadge tone="red">Missing · choose replacement</SourceBadge>
+                                ) : node.omittedOnce ? (
+                                  <SourceBadge tone="amber">Omitted once · awaiting confirmation</SourceBadge>
                                 ) : (
                                   <SourceBadge tone="accent" dot>Available</SourceBadge>
                                 )}
@@ -356,4 +465,11 @@ function sourceTypeLabel(type: SourceType): string {
 function formatProgress(allowance: ImportPreview['allowance']): string {
   if (allowance.kind !== 'full') return ''
   return `${formatBytes(allowance.used)} of ${formatBytes(allowance.total)}`
+}
+
+function nodeTestFailureText(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('Connect Clashfork')) return 'Connect Clashfork to test'
+  if (message.includes('Reconnect Clashfork')) return 'Reconnect to test this update'
+  return 'No response'
 }

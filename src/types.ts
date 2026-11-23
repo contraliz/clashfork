@@ -34,6 +34,7 @@ export interface ServiceView {
   missingCount: number
   allowance: Allowance
   stale: boolean
+  omittedNodeIds: string[]
   lastRefreshAt: number | null
   lastError: string | null
 }
@@ -47,7 +48,28 @@ export interface NodeView {
   displayName: string
   protocol: string
   missing: boolean
+  omittedOnce: boolean
   coreName: string
+  latencyMs?: number | null
+  latencyMeasuredAtMs?: number | null
+}
+
+export interface NodeTestProgress {
+  total: number
+  completed: number
+  responded: number
+  failed: number
+  nodeId: string | null
+  latencyMs: number | null
+  finished: boolean
+}
+
+export interface NodeTestSummary {
+  total: number
+  completed: number
+  responded: number
+  failed: number
+  cancelled: boolean
 }
 
 export interface MatchCondition {
@@ -65,6 +87,8 @@ export interface MatchGroup {
 export interface RulesetEntry {
   id: string
   matchGroupId: string
+  name: string
+  conditions: MatchCondition[]
   destination: Destination
 }
 
@@ -72,7 +96,7 @@ export interface Ruleset {
   id: string
   name: string
   entries: RulesetEntry[]
-  miscellaneous: 'direct' | 'block'
+  miscellaneous: Destination
 }
 
 export interface Selection {
@@ -102,6 +126,8 @@ export interface RuntimeView {
   serviceMessage: string | null
   lastError: string | null
   activeSummary: string | null
+  competingTunnel: boolean
+  pendingReconnectServices: string[]
 }
 
 export interface AppState {
@@ -154,6 +180,7 @@ export interface LiveRoute {
 
 export interface LiveSnapshot {
   active: boolean
+  available: boolean
   downloadRate: number
   uploadRate: number
   downloadTotal: number
@@ -164,10 +191,9 @@ export interface LiveSnapshot {
 
 export interface LiveRates {
   active: boolean
-  downloadRate: number
-  uploadRate: number
-  downloadTotal: number
-  uploadTotal: number
+  available: boolean
+  proxyDownloadRate: number
+  proxyUploadRate: number
   sampledAt: number
 }
 
@@ -176,6 +202,8 @@ export interface HistoryBar {
   label: string
   download: number
   upload: number
+  proxyTotal: number
+  directTotal: number
   gap: boolean
 }
 
@@ -219,7 +247,7 @@ export interface SaveRulesetInput {
   id: string | null
   name: string
   entries: RulesetEntry[]
-  miscellaneous: 'direct' | 'block'
+  miscellaneous: Destination
 }
 
 export interface SaveMatchGroupInput {

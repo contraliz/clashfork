@@ -1,6 +1,6 @@
 [package]
 name = "clashfork"
-version = "1.0.4"
+version = "1.0.12"
 description = "Clashfork desktop client"
 authors = ["Clashfork contributors"]
 license = "GPL-3.0-only"
@@ -40,6 +40,8 @@ clashfork_service_ipc = { path = "../vendor/clashfork-service-ipc", features = [
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Networking_WinSock",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Security_Cryptography",
