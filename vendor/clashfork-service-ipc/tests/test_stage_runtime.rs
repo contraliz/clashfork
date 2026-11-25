@@ -37,11 +37,12 @@ impl RunningCore {
         let _ = std::fs::remove_dir_all(&app_root);
         std::fs::create_dir_all(&app_root)?;
         let app_root = std::fs::canonicalize(app_root)?;
-        std::fs::copy(
-            common::test_bin_path("mock_binary"),
-            app_root.join(format!("mock_binary{}", std::env::consts::EXE_SUFFIX)),
-        )?;
-        let credentials = test_owner_credentials(&app_root)?;
+        let mock_binary = common::test_bin_path("mock_binary");
+        let copied_binary = app_root.join(format!("mock_binary{}", std::env::consts::EXE_SUFFIX));
+        std::fs::copy(&mock_binary, &copied_binary).with_context(|| {
+            format!("could not copy test core from {mock_binary:?} to {copied_binary:?}")
+        })?;
+        let credentials = test_owner_credentials(&app_root).context("could not create test owner credentials")?;
         let token = "ab".repeat(32);
         let response = start_clash(
             &credentials,
@@ -51,7 +52,8 @@ impl RunningCore {
                 macos_proxy: None,
             },
         )
-        .await?;
+        .await
+        .context("could not start the mock core through the service")?;
         anyhow::ensure!(response.code == 0, "{}", response.message);
         let generation = response.data.context("start omitted its result")?.session.generation;
         let pid = get_status(&credentials)
@@ -60,7 +62,10 @@ impl RunningCore {
             .context("status omitted data")?
             .core_pid
             .context("started core has no pid")?;
-        let runtime_dir = service_paths()?.for_owner(&credentials.identity).runtime_dir();
+        let runtime_dir = service_paths()
+            .context("could not resolve service paths")?
+            .for_owner(&credentials.identity)
+            .runtime_dir();
 
         Ok(Self {
             credentials,
