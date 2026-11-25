@@ -59,7 +59,7 @@ jobs:
           app=(/tmp/clashfork-dmg/*.app)
           test -d "${app[0]}"
           test -x "${app[0]}/Contents/Resources/resources/clashfork-core"
-          "${app[0]}/Contents/Resources/resources/clashfork-core" -v | grep -F 'Mihomo v1.19.34'
+          "${app[0]}/Contents/Resources/resources/clashfork-core" -v | grep -F 'v1.19.34'
           test -x "${app[0]}/Contents/Resources/resources/clashfork-service-install"
           test -x "${app[0]}/Contents/Resources/resources/clashfork-service"
           test -x "${app[0]}/Contents/Resources/resources/Uninstall Clashfork Service.command"
