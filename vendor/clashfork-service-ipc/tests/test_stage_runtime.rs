@@ -77,16 +77,24 @@ impl RunningCore {
     }
 
     async fn stage(&self, runtime: &RuntimeBundle) -> Result<StageRuntimeOutcome> {
-        let response = stage_runtime(&self.credentials, &self.session, runtime).await?;
+        let response = stage_runtime(&self.credentials, &self.session, runtime)
+            .await
+            .context("could not stage the mock runtime through the service")?;
         anyhow::ensure!(response.code == 0, "{}", response.message);
         response.data.context("staging omitted its outcome")
     }
 
     async fn shut_down(self) -> Result<()> {
-        let response = stop_clash(&self.credentials, &self.session).await?;
+        let response = stop_clash(&self.credentials, &self.session)
+            .await
+            .context("could not stop the mock core through the service")?;
         anyhow::ensure!(response.code == 0, "{}", response.message);
-        std::fs::remove_dir_all(self.generation)?;
-        std::fs::remove_dir_all(self.app_root)?;
+        match std::fs::remove_dir_all(&self.generation) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("could not remove mock runtime state"),
+        }
+        std::fs::remove_dir_all(&self.app_root).context("could not remove mock core test directory")?;
         Ok(())
     }
 }
