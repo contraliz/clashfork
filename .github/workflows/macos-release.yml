@@ -68,8 +68,15 @@ jobs:
           open "${app[0]}"
           for _ in {1..20}; do pgrep -x "$app_executable" >/dev/null && break; sleep 1; done
           if ! pgrep -x "$app_executable" >/dev/null; then
+            echo "CFBundleExecutable=$app_executable"
             pgrep -alf 'Clashfork|clashfork' || true
+            spctl --assess --type execute --verbose=4 "${app[0]}" 2>&1 || true
             log show --last 2m --style compact --predicate "process == '$app_executable'" 2>&1 || true
+            if [[ -d "$HOME/Library/Logs/DiagnosticReports" ]]; then
+              find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -mmin -5 \
+                \( -iname '*Clashfork*' -o -iname '*clashfork*' \) \
+                -print -exec tail -n 80 {} \; || true
+            fi
             exit 1
           fi
       - name: Install the service on the disposable runner
