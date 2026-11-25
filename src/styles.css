@@ -2375,6 +2375,21 @@ textarea {
   gap: 7px;
 }
 
+.clear-history-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-right: auto;
+  color: var(--text-soft);
+  font-size: 11.5px;
+  line-height: 1.3;
+}
+
+.modal-footer:has(.clear-history-confirm) {
+  flex-wrap: wrap;
+}
+
 /* Responsive desktop layout */
 @media (max-width: 1180px) {
   .rules-table-head,

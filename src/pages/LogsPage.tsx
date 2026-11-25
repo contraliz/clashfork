@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api'
 import { formatBytes, formatTime, prettyDateRange } from '../lib/format'
 import { sortDiagnosticsNewestFirst } from '../lib/diagnostics'
@@ -23,6 +23,7 @@ import {
   PageHeader,
   Panel,
   PanelHeading,
+  Toggle,
   Toolbar,
 } from '../components/ui'
 
@@ -77,6 +78,9 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
   const [inspectedPeriod, setInspectedPeriod] = useState<HistoryBar | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [clearOpen, setClearOpen] = useState(false)
+  const [clearConfirmed, setClearConfirmed] = useState(false)
+  const [clearPending, setClearPending] = useState(false)
+  const clearPendingRef = useRef(false)
   const [groupOpen, setGroupOpen] = useState(false)
   const [diagnostics, setDiagnostics] = useState<DiagnosticEntry[]>([])
 
@@ -162,6 +166,29 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
     () => sortDiagnosticsNewestFirst(diagnostics),
     [diagnostics],
   )
+
+  const closeClearDialog = () => {
+    if (clearPendingRef.current) return
+    setClearConfirmed(false)
+    setClearOpen(false)
+  }
+
+  const clearHistory = async () => {
+    if (!clearConfirmed || clearPendingRef.current) return
+    clearPendingRef.current = true
+    setClearPending(true)
+    try {
+      onSnapshot(await api.clearHistory(true))
+      setClearConfirmed(false)
+      setClearOpen(false)
+      setHistoryRevision((revision) => revision + 1)
+    } catch (error) {
+      onError(error)
+    } finally {
+      clearPendingRef.current = false
+      setClearPending(false)
+    }
+  }
 
   return (
     <div>
@@ -470,25 +497,24 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
         <Modal
           title="Clear traffic history"
           description="This permanently deletes the local minute aggregates and custom-group results. It does not change your VPN or subscriptions."
-          onClose={() => setClearOpen(false)}
+          onClose={closeClearDialog}
           footer={
             <>
-              <Button onClick={() => setClearOpen(false)}>Cancel</Button>
+              <div className="clear-history-confirm">
+                <Toggle
+                  checked={clearConfirmed}
+                  onChange={setClearConfirmed}
+                  label="Confirm deletion"
+                  disabled={clearPending}
+                />
+                <span>Confirm deletion</span>
+              </div>
+              <Button onClick={closeClearDialog} disabled={clearPending}>Cancel</Button>
               <Button
                 variant="danger"
-                busy={busy === 'clear'}
-                onClick={async () => {
-                  setBusy('clear')
-                  try {
-                    onSnapshot(await api.clearHistory(true))
-                    setClearOpen(false)
-                    setHistoryRevision((revision) => revision + 1)
-                  } catch (error) {
-                    onError(error)
-                  } finally {
-                    setBusy(null)
-                  }
-                }}
+                busy={clearPending}
+                disabled={!clearConfirmed}
+                onClick={() => void clearHistory()}
               >
                 Clear history
               </Button>
