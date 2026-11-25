@@ -321,6 +321,28 @@ pub fn prepare_install_if_requested() -> Result<bool> {
     Ok(true)
 }
 
+/// Re-launches the bundled uninstaller with the existing macOS administrator prompt.
+#[cfg(all(feature = "client", target_os = "macos"))]
+pub fn prepare_uninstall_if_requested() -> Result<bool> {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--prepare-uninstall")) {
+        return Ok(false);
+    }
+    anyhow::ensure!(arguments.next().is_none(), "unexpected uninstall arguments");
+    let source = std::env::current_exe()?;
+    let staging = Staging::new()?;
+    let staged = staging.0.join(source.file_name().context("uninstaller has no name")?);
+    std::fs::copy(&source, &staged)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+        let gid = unsafe { platform_lib::getgid() };
+        elevate(&staged, &[], gid, "Remove Clashfork's protected VPN service")?;
+    }
+    Ok(true)
+}
+
 #[cfg(any(all(feature = "client", target_os = "macos"), test))]
 fn shell_quote(value: &std::ffi::OsStr) -> String {
     format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"))

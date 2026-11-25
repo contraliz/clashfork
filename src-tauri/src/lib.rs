@@ -7,8 +7,16 @@ mod network;
 mod paths;
 mod rules;
 mod runtime;
+#[cfg(windows)]
+mod security;
+#[cfg(target_os = "macos")]
+#[path = "security_macos.rs"]
 mod security;
 mod service_client;
+#[cfg(windows)]
+mod single_instance;
+#[cfg(target_os = "macos")]
+#[path = "single_instance_macos.rs"]
 mod single_instance;
 mod store;
 mod subscription;

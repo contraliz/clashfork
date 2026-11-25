@@ -10,8 +10,8 @@
     "test": "node scripts/ui-qa.mjs",
     "tauri": "tauri",
     "build": "tauri build -- --locked",
-    "prebuild": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-bundle.ps1",
-    "prepare:bundle": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-bundle.ps1",
+    "prebuild": "node scripts/prepare-bundle.mjs",
+    "prepare:bundle": "node scripts/prepare-bundle.mjs",
     "qa:ui": "node scripts/ui-qa.mjs"
   },
   "dependencies": {

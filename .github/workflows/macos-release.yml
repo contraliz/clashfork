@@ -1,0 +1,102 @@
+name: macOS release builds
+
+on:
+  push:
+    branches: [codex/macos-release]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            rust_target: aarch64-apple-darwin
+            artifact: Clashfork-macOS-Apple-Silicon
+          - runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            artifact: Clashfork-macOS-Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          targets: ${{ matrix.rust_target }}
+          components: rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:web
+      - run: cargo fmt --check
+      - run: cargo test --locked -p clashfork --lib
+      - run: cargo test --locked --manifest-path vendor/clashfork-service-ipc/Cargo.toml --features standalone,client,test
+      - run: npm run build
+      - name: Verify DMG structure and bundled core
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg=(target/release/bundle/dmg/*.dmg)
+          test -f "${dmg[0]}"
+          test "${#dmg[@]}" -eq 1
+          hdiutil verify "${dmg[0]}"
+          mkdir -p /tmp/clashfork-dmg
+          attached=0
+          cleanup() {
+            pkill -TERM -x clashfork 2>/dev/null || true
+            if [[ "$attached" -eq 1 ]]; then hdiutil detach /tmp/clashfork-dmg -force >/dev/null 2>&1 || true; fi
+          }
+          trap cleanup EXIT
+          hdiutil attach "${dmg[0]}" -mountpoint /tmp/clashfork-dmg -nobrowse -readonly
+          attached=1
+          app=(/tmp/clashfork-dmg/*.app)
+          test -d "${app[0]}"
+          test -x "${app[0]}/Contents/Resources/resources/clashfork-core"
+          "${app[0]}/Contents/Resources/resources/clashfork-core" -v | grep -F 'Mihomo v1.19.34'
+          test -x "${app[0]}/Contents/Resources/resources/clashfork-service-install"
+          test -x "${app[0]}/Contents/Resources/resources/clashfork-service"
+          test -x "${app[0]}/Contents/Resources/resources/Uninstall Clashfork Service.command"
+          open "${app[0]}"
+          for _ in {1..20}; do pgrep -x clashfork >/dev/null && break; sleep 1; done
+          pgrep -x clashfork >/dev/null
+      - name: Install the service on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          core_hash=$(shasum -a 256 src-tauri/resources/clashfork-core | awk '{print $1}')
+          sudo "target/service/${{ matrix.rust_target }}/release/clashfork-service-install" \
+            --install-service \
+            --install-core "$PWD/src-tauri/resources/clashfork-core" \
+            --sha256 "$core_hash"
+      - name: Exercise authenticated TUN lifecycle and Rule/Global modes
+        env:
+          CLASHFORK_CORE_PATH: /Library/Application Support/clashfork-service/cores/clashfork-core
+          RUST_TEST_THREADS: "1"
+        run: cargo test --locked -p clashfork --lib -- --ignored stock_mihomo_
+      - name: Stop and remove the service from the disposable runner
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper="target/service/${{ matrix.rust_target }}/release/clashfork-service-uninstall"
+          if [[ -x "$helper" ]]; then sudo "$helper"; fi
+          interface=$(/sbin/route -n get 1.1.1.1 2>/dev/null | awk '/interface:/ { print $2; exit }' || true)
+          if [[ "$interface" == "utun1000" ]]; then
+            echo "Clashfork's utun route remained after service cleanup."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/release/bundle/dmg/*.dmg
+            docs/macos.md
+          if-no-files-found: error
+          retention-days: 14
