@@ -458,6 +458,8 @@ mod tests {
 #[cfg(all(test, target_os = "macos"))]
 mod macos_service_tun_smoke {
     use super::*;
+    use crate::controller::CoreController;
+    use reqwest::Client;
     use std::{net::TcpListener, process::Command, time::Duration};
 
     fn free_port() -> u16 {

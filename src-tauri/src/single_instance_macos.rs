@@ -1,5 +1,9 @@
 use fs2::FileExt as _;
-use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, sync::OnceLock};
+use std::{
+    fs::OpenOptions,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    sync::OnceLock,
+};
 
 static INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
 
