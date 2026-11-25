@@ -42,7 +42,7 @@ jobs:
       - name: Verify DMG structure and bundled core
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           dmg=(target/release/bundle/dmg/*.dmg)
           test -f "${dmg[0]}"
           test "${#dmg[@]}" -eq 1
