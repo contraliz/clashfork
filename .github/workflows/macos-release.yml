@@ -69,6 +69,7 @@ jobs:
           for _ in {1..20}; do pgrep -x "$app_executable" >/dev/null && break; sleep 1; done
           if ! pgrep -x "$app_executable" >/dev/null; then
             pgrep -alf 'Clashfork|clashfork' || true
+            log show --last 2m --style compact --predicate "process == '$app_executable'" 2>&1 || true
             exit 1
           fi
       - name: Install the service on the disposable runner
