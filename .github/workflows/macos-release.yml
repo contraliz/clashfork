@@ -63,9 +63,14 @@ jobs:
           test -x "${app[0]}/Contents/Resources/resources/clashfork-service-install"
           test -x "${app[0]}/Contents/Resources/resources/clashfork-service"
           test -x "${app[0]}/Contents/Resources/resources/Uninstall Clashfork Service.command"
+          app_executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${app[0]}/Contents/Info.plist")
+          test -x "${app[0]}/Contents/MacOS/${app_executable}"
           open "${app[0]}"
-          for _ in {1..20}; do pgrep -x clashfork >/dev/null && break; sleep 1; done
-          pgrep -x clashfork >/dev/null
+          for _ in {1..20}; do pgrep -x "$app_executable" >/dev/null && break; sleep 1; done
+          if ! pgrep -x "$app_executable" >/dev/null; then
+            pgrep -alf 'Clashfork|clashfork' || true
+            exit 1
+          fi
       - name: Install the service on the disposable runner
         shell: bash
         run: |
