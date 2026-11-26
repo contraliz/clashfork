@@ -124,6 +124,8 @@ let customGroups: CustomAppGroup[] = [
   { id: 'appgroup_chat', name: 'AI tools', apps: ['ChatGPT.exe'] },
 ]
 
+let historyCleared = false
+
 let state: AppState = {
   services,
   nodes,
@@ -538,19 +540,22 @@ export async function invoke(command: string, args?: Record<string, unknown>): P
       return delay(snapshot())
     case 'clear_history':
       if (!args?.confirm) throw new Error('Confirmation is required to clear traffic history.')
+      historyCleared = true
       return delay(snapshot())
     case 'get_history':
-      return trackMockPending('get_history', delay(history(args?.input as HistoryInput, state.customAppGroups)))
+      return trackMockPending('get_history', delay(history(args?.input as HistoryInput, state.customAppGroups, historyCleared)))
     case 'get_live':
       return trackMockPending('get_live', delay(live()))
     case 'get_live_rates': {
       const current = live()
       const proxyRows = current.connections.filter((item) => item.route.startsWith('Falemon /'))
+      const qaUnavailable = typeof window !== 'undefined'
+        && (window as Window & { __clashforkQaRatesUnavailable?: boolean }).__clashforkQaRatesUnavailable === true
       const rates: LiveRates = {
         active: current.active,
-        available: current.active,
-        proxyDownloadRate: proxyRows.reduce((sum, item) => sum + item.downloadRate, 0),
-        proxyUploadRate: proxyRows.reduce((sum, item) => sum + item.uploadRate, 0),
+        available: current.active && !qaUnavailable,
+        proxyDownloadRate: qaUnavailable ? 0 : proxyRows.reduce((sum, item) => sum + item.downloadRate, 0),
+        proxyUploadRate: qaUnavailable ? 0 : proxyRows.reduce((sum, item) => sum + item.uploadRate, 0),
         sampledAt: current.sampledAt,
       }
       if (typeof window !== 'undefined') {
@@ -582,7 +587,7 @@ export async function invoke(command: string, args?: Record<string, unknown>): P
   }
 }
 
-function history(input: HistoryInput, groups: CustomAppGroup[]): HistoryReport {
+function history(input: HistoryInput, groups: CustomAppGroup[], cleared = false): HistoryReport {
   const timestamp = now()
   const currentDate = new Date(timestamp * 1000)
   const today = new Date(currentDate)
@@ -590,6 +595,20 @@ function history(input: HistoryInput, groups: CustomAppGroup[]): HistoryReport {
   const dayCount = input.range === '30d' ? 30 : input.range === '7d' ? 7 : 1
   const firstDay = new Date(today)
   firstDay.setDate(firstDay.getDate() - (dayCount - 1))
+  if (cleared) {
+    return {
+      from: Math.floor(firstDay.getTime() / 1000),
+      to: timestamp,
+      totalDownload: 0,
+      totalUpload: 0,
+      total: 0,
+      gapMinutes: 0,
+      bars: [],
+      rows: [],
+      breakdown: input.breakdown,
+      availableApps: [],
+    }
+  }
   const periodCount = input.range === 'today' ? currentDate.getHours() + 1 : dayCount
   const scale = input.range === '30d' ? 0.42 : input.range === 'today' ? 0.08 : 1
   const baseBars = Array.from({ length: periodCount }, (_, index) => {
@@ -611,13 +630,14 @@ function history(input: HistoryInput, groups: CustomAppGroup[]): HistoryReport {
     }
   })
   const shares = [
-    { app: 'ChatGPT.exe', route: 'Falemon / Singapore I0', routeClass: 'proxy' as const, download: 0.20, upload: 0.18 },
-    { app: 'ChatGPT.exe', route: 'Direct', routeClass: 'direct' as const, download: 0.10, upload: 0.08 },
-    { app: 'ChatGPT.exe', route: 'Blocked', routeClass: 'blocked' as const, download: 0.02, upload: 0.01 },
-    { app: 'ChatGPT.exe', route: 'Unknown chain', routeClass: 'unknown' as const, download: 0.01, upload: 0.01 },
-    { app: 'codex.exe', route: 'Falemon / Singapore I0', routeClass: 'proxy' as const, download: 0.19, upload: 0.21 },
-    { app: 'steam.exe', route: 'Direct', routeClass: 'direct' as const, download: 0.17, upload: 0.22 },
-    { app: 'firefox.exe', route: 'Unknown chain', routeClass: 'unknown' as const, download: 0.03, upload: 0.03 },
+    { app: 'ChatGPT.exe', route: 'Falemon / Singapore I0', routeClass: 'proxy' as const, rule: 'Google', download: 0.12, upload: 0.10 },
+    { app: 'ChatGPT.exe', route: 'Falemon / Singapore I0', routeClass: 'proxy' as const, rule: 'YouTube', download: 0.08, upload: 0.08 },
+    { app: 'ChatGPT.exe', route: 'Direct', routeClass: 'direct' as const, rule: 'ChatGPT direct rule', download: 0.10, upload: 0.08 },
+    { app: 'ChatGPT.exe', route: 'Blocked', routeClass: 'blocked' as const, rule: 'Blocked rule', download: 0.02, upload: 0.01 },
+    { app: 'ChatGPT.exe', route: 'Unknown chain', routeClass: 'unknown' as const, rule: 'Unattributed', download: 0.01, upload: 0.01 },
+    { app: 'codex.exe', route: 'Falemon / Singapore I0', routeClass: 'proxy' as const, rule: 'Development', download: 0.19, upload: 0.21 },
+    { app: 'steam.exe', route: 'Direct', routeClass: 'direct' as const, rule: 'Everything else', download: 0.17, upload: 0.22 },
+    { app: 'firefox.exe', route: 'Unknown chain', routeClass: 'unknown' as const, rule: 'Unattributed', download: 0.03, upload: 0.03 },
   ]
   const availableApps = [...new Map(shares.map((sample) => [sample.app.toLowerCase(), sample.app])).values()]
     .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }))
@@ -660,7 +680,13 @@ function history(input: HistoryInput, groups: CustomAppGroup[]): HistoryReport {
       const group = subjectFilter?.kind === 'group' && selectedGroup?.apps.some((app) => app.toLowerCase() === sample.app.toLowerCase())
         ? selectedGroup
         : groups.find((candidate) => candidate.apps.some((app) => app.toLowerCase() === sample.app.toLowerCase()))
-      const label = input.breakdown === 'route' ? sample.route : input.breakdown === 'customGroup' ? group?.name ?? sample.app : sample.app
+      const label = input.breakdown === 'route'
+        ? sample.route
+        : input.breakdown === 'customGroup'
+          ? group?.name ?? sample.app
+          : input.breakdown === 'rule'
+            ? sample.rule
+            : sample.app
       const app = input.breakdown === 'app' || (input.breakdown === 'customGroup' && !group) ? sample.app : null
       const route = input.breakdown === 'route' ? sample.route : null
       const key = `${label}\u0000${sample.routeClass}`

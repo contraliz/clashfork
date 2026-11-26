@@ -72,28 +72,6 @@ export function useLiveRates(enabled = true): LiveRates {
   return useVisiblePoll(enabled, api.getLiveRates, emptyRates)
 }
 
-export function useRatePoints(
-  live: Pick<LiveRates, 'active' | 'available' | 'proxyDownloadRate' | 'proxyUploadRate' | 'sampledAt'>,
-  limit = 60,
-): Array<{ at: number; download: number; upload: number }> {
-  const [points, setPoints] = useState<Array<{ at: number; download: number; upload: number }>>([])
-  useEffect(() => {
-    if (!live.active || !live.available) {
-      setPoints([])
-      return
-    }
-    if (!live.sampledAt) return
-    setPoints((current) => {
-      if (current.some((point) => point.at === live.sampledAt)) return current
-      return [
-        ...current,
-        { at: live.sampledAt, download: live.proxyDownloadRate, upload: live.proxyUploadRate },
-      ].slice(-limit)
-    })
-  }, [limit, live.active, live.available, live.proxyDownloadRate, live.sampledAt, live.proxyUploadRate])
-  return points
-}
-
 export function useNow(intervalMs = 1000): number {
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
   useEffect(() => {

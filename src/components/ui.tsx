@@ -44,12 +44,13 @@ export function IconButton({
   icon,
   label,
   variant = 'quiet',
+  className = '',
   ...props
 }: { icon: IconName; label: string; variant?: ButtonVariant } & ButtonHTMLAttributes<HTMLButtonElement>) {
   return (
     <button
       type="button"
-      className={`icon-button icon-button-${variant}`}
+      className={`icon-button icon-button-${variant} ${className}`.trim()}
       aria-label={label}
       title={label}
       {...props}
@@ -233,6 +234,20 @@ export function Modal({
     previousFocus.current = document.activeElement
     const previousOverflow = document.body.style.overflow
     document.body.style.overflow = 'hidden'
+    const frame = requestAnimationFrame(() => {
+      const dialog = dialogRef.current
+      if (!dialog || dialog.contains(document.activeElement)) return
+      const auto = dialog.querySelector<HTMLElement>('[data-autofocus]')
+      ;(auto ?? dialog).focus()
+    })
+    return () => {
+      cancelAnimationFrame(frame)
+      document.body.style.overflow = previousOverflow
+      if (previousFocus.current instanceof HTMLElement) previousFocus.current.focus()
+    }
+  }, [])
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onClose()
       if (event.key !== 'Tab' || !dialogRef.current) return
@@ -254,15 +269,7 @@ export function Modal({
       }
     }
     document.addEventListener('keydown', onKeyDown)
-    requestAnimationFrame(() => {
-      const auto = dialogRef.current?.querySelector<HTMLElement>('[data-autofocus]')
-      ;(auto ?? dialogRef.current)?.focus()
-    })
-    return () => {
-      document.removeEventListener('keydown', onKeyDown)
-      document.body.style.overflow = previousOverflow
-      if (previousFocus.current instanceof HTMLElement) previousFocus.current.focus()
-    }
+    return () => document.removeEventListener('keydown', onKeyDown)
   }, [onClose])
 
   return createPortal(

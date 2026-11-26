@@ -16,8 +16,21 @@ struct FilteredSample {
     app: String,
     route: String,
     route_class: RouteClass,
+    rule_id: String,
+    rule_label: String,
     download: u64,
     upload: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowRecord {
+    pub app: String,
+    pub route: String,
+    pub route_class: RouteClass,
+    pub rule_id: Option<String>,
+    pub rule_label: Option<String>,
+    pub download: u64,
+    pub upload: u64,
 }
 
 impl HistoryStore {
@@ -38,9 +51,11 @@ impl HistoryStore {
                 app TEXT NOT NULL,
                 route TEXT NOT NULL,
                 route_class TEXT NOT NULL DEFAULT 'unknown',
+                rule_id TEXT NOT NULL DEFAULT '',
+                rule_label TEXT NOT NULL DEFAULT '',
                 download INTEGER NOT NULL DEFAULT 0,
                 upload INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (minute, app, route, route_class)
+                PRIMARY KEY (minute, app, route, route_class, rule_id)
             );
             CREATE INDEX IF NOT EXISTS idx_minute_apps_minute ON minute_apps(minute);
             CREATE TABLE IF NOT EXISTS gap_ranges (
@@ -50,6 +65,7 @@ impl HistoryStore {
             );",
         )?;
         migrate_route_class(&mut conn)?;
+        migrate_rule_columns(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -73,21 +89,48 @@ impl HistoryStore {
         at: i64,
         flows: &[(String, String, RouteClass, u64, u64)],
     ) -> Result<()> {
+        let flows = flows
+            .iter()
+            .map(|(app, route, route_class, download, upload)| FlowRecord {
+                app: app.clone(),
+                route: route.clone(),
+                route_class: *route_class,
+                rule_id: None,
+                rule_label: None,
+                download: *download,
+                upload: *upload,
+            })
+            .collect::<Vec<_>>();
+        self.record_flows(at, &flows)
+    }
+
+    pub fn record_flows(&mut self, at: i64, flows: &[FlowRecord]) -> Result<()> {
         if flows.is_empty() {
             return Ok(());
         }
         let minute = minute_start(at);
         let tx = self.conn.transaction()?;
-        for (app, route, route_class, download, upload) in flows {
-            if *download == 0 && *upload == 0 {
+        for flow in flows {
+            if flow.download == 0 && flow.upload == 0 {
                 continue;
             }
             tx.execute(
-                "INSERT INTO minute_apps(minute, app, route, route_class, download, upload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(minute, app, route, route_class) DO UPDATE SET
+                "INSERT INTO minute_apps(minute, app, route, route_class, rule_id, rule_label, download, upload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(minute, app, route, route_class, rule_id) DO UPDATE SET
+                    rule_label = excluded.rule_label,
                     download = download + excluded.download,
                     upload = upload + excluded.upload",
-                params![minute, app, route, route_class_name(*route_class), to_i64(*download)?, to_i64(*upload)?],
+                params![
+                    minute,
+                    flow.app,
+                    flow.route,
+                    route_class_name(flow.route_class),
+                    flow.rule_id.as_deref().unwrap_or(""),
+                    flow.rule_label.as_deref().unwrap_or(""),
+                    to_i64(flow.download)?,
+                    to_i64(flow.upload)?,
+                ],
             )?;
         }
         tx.commit()?;
@@ -353,8 +396,8 @@ impl HistoryStore {
         }
 
         let mut sample_stmt = self.conn.prepare(
-            "SELECT minute, app, route, route_class, download, upload FROM minute_apps
-             WHERE minute >= ?1 AND minute <= ?2 ORDER BY minute, app, route, route_class",
+            "SELECT minute, app, route, route_class, rule_id, rule_label, download, upload FROM minute_apps
+             WHERE minute >= ?1 AND minute <= ?2 ORDER BY minute, app, route, route_class, rule_id",
         )?;
         let sample_rows = sample_stmt.query_map(params![from, to], |row| {
             Ok((
@@ -362,13 +405,15 @@ impl HistoryStore {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?;
         let mut samples_by_minute: BTreeMap<i64, Vec<FilteredSample>> = BTreeMap::new();
         for row in sample_rows {
-            let (minute, app, route, class, download, upload) = row?;
+            let (minute, app, route, class, rule_id, rule_label, download, upload) = row?;
             let route_class = route_class_from_db(&class);
             let route_matches = match route_filter {
                 None => true,
@@ -396,6 +441,8 @@ impl HistoryStore {
                         app,
                         route,
                         route_class,
+                        rule_id,
+                        rule_label,
                         download: u64::try_from(download.max(0)).unwrap_or(0),
                         upload: u64::try_from(upload.max(0)).unwrap_or(0),
                     });
@@ -446,6 +493,8 @@ impl HistoryStore {
                     breakdown,
                     &sample.app,
                     &sample.route,
+                    &sample.rule_id,
+                    &sample.rule_label,
                     groups,
                     subject_filter,
                 );
@@ -504,16 +553,18 @@ impl HistoryStore {
         total_upload: u64,
     ) -> Result<Vec<HistoryRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT app, route, route_class, sum(download), sum(upload) FROM minute_apps
-             WHERE minute >= ?1 AND minute <= ?2 GROUP BY app, route, route_class",
+            "SELECT app, route, route_class, rule_id, max(rule_label), sum(download), sum(upload) FROM minute_apps
+             WHERE minute >= ?1 AND minute <= ?2 GROUP BY app, route, route_class, rule_id",
         )?;
         let raw = stmt.query_map(params![from, to], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         let mut aggregate: BTreeMap<
@@ -521,11 +572,21 @@ impl HistoryStore {
             (u64, u64, Option<String>, Option<String>),
         > = BTreeMap::new();
         for row in raw {
-            let (app, route, class, down, up) = row?;
+            let (app, route, class, rule_id, rule_label, down, up) = row?;
             let route_class = route_class_from_db(&class);
             let down = u64::try_from(down.max(0)).unwrap_or(0);
             let up = u64::try_from(up.max(0)).unwrap_or(0);
             let (label, app_field, route_field) = match breakdown {
+                "rule" => {
+                    let label = if rule_id.is_empty() {
+                        "Unattributed".to_owned()
+                    } else if rule_label.is_empty() {
+                        "Rule".to_owned()
+                    } else {
+                        rule_label
+                    };
+                    (label, None, None)
+                }
                 "customGroup" => {
                     let group = groups.iter().find(|group| {
                         group
@@ -660,6 +721,44 @@ fn migrate_route_class(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_rule_columns(conn: &mut Connection) -> Result<()> {
+    let has_rule_id = {
+        let mut statement = conn.prepare("PRAGMA table_info(minute_apps)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "rule_id")
+    };
+    if has_rule_id {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_minute_apps_minute;
+         ALTER TABLE minute_apps RENAME TO minute_apps_legacy;
+         CREATE TABLE minute_apps (
+             minute INTEGER NOT NULL,
+             app TEXT NOT NULL,
+             route TEXT NOT NULL,
+             route_class TEXT NOT NULL DEFAULT 'unknown',
+             rule_id TEXT NOT NULL DEFAULT '',
+             rule_label TEXT NOT NULL DEFAULT '',
+             download INTEGER NOT NULL DEFAULT 0,
+             upload INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (minute, app, route, route_class, rule_id)
+         );
+         INSERT INTO minute_apps(minute, app, route, route_class, rule_id, rule_label, download, upload)
+         SELECT minute, app, route, route_class, '', '', download, upload
+         FROM minute_apps_legacy;
+         DROP TABLE minute_apps_legacy;
+         CREATE INDEX idx_minute_apps_minute ON minute_apps(minute);",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn route_class_name(class: RouteClass) -> &'static str {
     match class {
         RouteClass::Proxy => "proxy",
@@ -682,10 +781,22 @@ fn row_identity(
     breakdown: &str,
     app: &str,
     route: &str,
+    rule_id: &str,
+    rule_label: &str,
     groups: &[CustomAppGroup],
     subject_filter: Option<&HistorySubjectFilter>,
 ) -> (String, Option<String>, Option<String>) {
     match breakdown {
+        "rule" => {
+            let label = if rule_id.is_empty() {
+                "Unattributed".to_owned()
+            } else if rule_label.is_empty() {
+                "Rule".to_owned()
+            } else {
+                rule_label.to_owned()
+            };
+            (label, None, None)
+        }
         "customGroup" => {
             let selected_group_id = match subject_filter {
                 Some(HistorySubjectFilter::Group { id }) => Some(id.as_str()),
@@ -826,9 +937,11 @@ mod tests {
                 app TEXT NOT NULL,
                 route TEXT NOT NULL,
                 route_class TEXT NOT NULL DEFAULT 'unknown',
+                rule_id TEXT NOT NULL DEFAULT '',
+                rule_label TEXT NOT NULL DEFAULT '',
                 download INTEGER NOT NULL DEFAULT 0,
                 upload INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (minute, app, route, route_class)
+                PRIMARY KEY (minute, app, route, route_class, rule_id)
             );
             CREATE TABLE gap_ranges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1413,6 +1526,123 @@ mod tests {
     }
 
     #[test]
+    fn rule_breakdown_separates_sibling_rules_and_catch_all() {
+        let mut history = memory();
+        let now = Local::now().timestamp();
+        history.record_totals(now, 1_000, 400).unwrap();
+        history
+            .record_flows(
+                now,
+                &[
+                    FlowRecord {
+                        app: "ChatGPT.exe".into(),
+                        route: "Falemon / Singapore".into(),
+                        route_class: RouteClass::Proxy,
+                        rule_id: Some("ruleset-1:google".into()),
+                        rule_label: Some("Google".into()),
+                        download: 300,
+                        upload: 100,
+                    },
+                    FlowRecord {
+                        app: "ChatGPT.exe".into(),
+                        route: "Falemon / Singapore".into(),
+                        route_class: RouteClass::Proxy,
+                        rule_id: Some("ruleset-1:youtube".into()),
+                        rule_label: Some("YouTube".into()),
+                        download: 250,
+                        upload: 50,
+                    },
+                    FlowRecord {
+                        app: "Steam.exe".into(),
+                        route: "Direct".into(),
+                        route_class: RouteClass::Direct,
+                        rule_id: Some("ruleset-1:local".into()),
+                        rule_label: Some("Local direct".into()),
+                        download: 100,
+                        upload: 50,
+                    },
+                    FlowRecord {
+                        app: "Firefox.exe".into(),
+                        route: "Direct".into(),
+                        route_class: RouteClass::Direct,
+                        rule_id: Some("ruleset-1:__everything_else__".into()),
+                        rule_label: Some("Everything else".into()),
+                        download: 50,
+                        upload: 20,
+                    },
+                    FlowRecord {
+                        app: "Legacy.exe".into(),
+                        route: "Direct".into(),
+                        route_class: RouteClass::Direct,
+                        rule_id: None,
+                        rule_label: None,
+                        download: 80,
+                        upload: 30,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let report = history.report("today", "rule", &[], now).unwrap();
+        assert_eq!((report.total_download, report.total_upload), (1_000, 400));
+        for label in [
+            "Google",
+            "YouTube",
+            "Local direct",
+            "Everything else",
+            "Unattributed",
+        ] {
+            assert!(
+                report.rows.iter().any(|row| row.label == label),
+                "missing rule label {label}: {:?}",
+                report
+                    .rows
+                    .iter()
+                    .map(|row| row.label.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            report.rows.iter().map(|row| row.total).sum::<u64>(),
+            report.total
+        );
+        assert!(
+            report
+                .rows
+                .iter()
+                .any(|row| row.label == "Google" && row.route_class == RouteClass::Proxy)
+        );
+        assert!(
+            report
+                .rows
+                .iter()
+                .any(|row| row.label == "Local direct" && row.route_class == RouteClass::Direct)
+        );
+
+        let proxy = history
+            .report_with_filters(
+                "today",
+                "rule",
+                &[],
+                now,
+                Some(HistoryRouteFilter::Proxy),
+                Some(&HistorySubjectFilter::App {
+                    name: "ChatGPT.exe".into(),
+                }),
+            )
+            .unwrap();
+        assert_eq!((proxy.total_download, proxy.total_upload), (550, 150));
+        assert!(
+            proxy
+                .rows
+                .iter()
+                .all(|row| row.route_class == RouteClass::Proxy)
+        );
+        assert!(proxy.rows.iter().any(|row| row.label == "Google"));
+        assert!(proxy.rows.iter().any(|row| row.label == "YouTube"));
+    }
+
+    #[test]
     fn legacy_rows_migrate_without_losing_totals_or_route_meaning() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.sqlite3");
@@ -1459,6 +1689,21 @@ mod tests {
                 .iter()
                 .any(|row| row.label == "Falemon / Hong Kong"
                     && row.route_class == RouteClass::Proxy)
+        );
+
+        let rule_report = history.report("today", "rule", &[], 1_800_000_000).unwrap();
+        assert_eq!(rule_report.total_download, 100);
+        assert_eq!(rule_report.total_upload, 40);
+        assert!(
+            rule_report
+                .rows
+                .iter()
+                .any(|row| row.label == "Unattributed")
+        );
+        assert_eq!(
+            rule_report.rows.iter().map(|row| row.total).sum::<u64>(),
+            rule_report.total,
+            "legacy rows without rule identity must keep authoritative totals"
         );
 
         let direct = history

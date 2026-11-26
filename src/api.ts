@@ -10,6 +10,7 @@ import type {
   LiveSnapshot,
   NodeTestProgress,
   NodeTestSummary,
+  SaveExportResult,
   SaveMatchGroupInput,
   SaveRulesetInput,
   Selection,
@@ -89,6 +90,8 @@ export const api = {
   deleteMatchGroup: (groupId: string) =>
     call<Snapshot>('delete_match_group', { groupId }),
   saveRuleset: (input: SaveRulesetInput) => call<Snapshot>('save_ruleset', { input }),
+  saveRoutingExport: (suggestedName: string, contents: string) =>
+    call<SaveExportResult>('save_routing_export', { suggestedName, contents }),
   deleteRuleset: (rulesetId: string) =>
     call<Snapshot>('delete_ruleset', { rulesetId }),
   savePreset: (name: string) => call<Snapshot>('save_preset', { name }),

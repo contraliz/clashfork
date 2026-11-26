@@ -1,6 +1,6 @@
 [package]
 name = "clashfork"
-version = "1.0.12"
+version = "1.0.13"
 description = "Clashfork desktop client"
 authors = ["Clashfork contributors"]
 license = "GPL-3.0-only"
@@ -22,7 +22,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 serde_yaml_ng = "=0.10.0"
 tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "net", "io-util", "process"] }
-reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "gzip", "json", "stream"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "http2", "gzip", "json", "stream"] }
 anyhow = "=1.0.104"
 chrono = { version = "=0.4.45", features = ["serde"] }
 parking_lot = "=0.12.5"
@@ -47,6 +47,7 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_Security_Cryptography",
   "Win32_Storage_FileSystem",
   "Win32_System_Threading",
+  "Win32_UI_Controls_Dialogs",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

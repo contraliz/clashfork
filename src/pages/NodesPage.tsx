@@ -1,7 +1,24 @@
-import { useEffect, useMemo, useState } from 'react'
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from 'react'
 import { api, subscribeNodeTestProgress } from '../api'
-import type { ImportPreview, NodeTestProgress, Snapshot, SourceType } from '../types'
+import type { ImportPreview, NodeTestProgress, NodeView, Snapshot, SourceType } from '../types'
 import { allowanceProgress, allowanceSummary, formatBytes, formatDate, formatExpiry } from '../lib/format'
+import {
+  applyNodeOrder,
+  loadNodesUiPreferences,
+  moveNodeByOffset,
+  placeNodeId,
+  sameNodeOrder,
+  saveNodesUiPreferences,
+  type NodeDropPlacement,
+  type NodesUiPreferences,
+} from '../lib/nodesUiState'
 import { Icon } from '../components/Icon'
 import { LatencyValue } from '../components/NodeLatency'
 import { useNowMs } from '../hooks'
@@ -24,11 +41,31 @@ interface Props {
   onError: (error: unknown) => void
 }
 
+interface NodeDragState {
+  serviceId: string
+  nodeId: string
+  pointerId: number
+  startX: number
+  startY: number
+  moved: boolean
+  targetId: string | null
+  placement: NodeDropPlacement | null
+}
+
+interface GroupDragState {
+  serviceId: string
+  pointerId: number
+  startX: number
+  startY: number
+  moved: boolean
+  targetId: string | null
+  placement: NodeDropPlacement | null
+}
+
 export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
   const { state } = snapshot
   const now = useNowMs(1000)
   const [search, setSearch] = useState('')
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   const [addOpen, setAddOpen] = useState(false)
   const [input, setInput] = useState('')
   const [preview, setPreview] = useState<ImportPreview | null>(null)
@@ -40,6 +77,36 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
   const [testFeedback, setTestFeedback] = useState<Record<string, string>>({})
   const [sweepFeedback, setSweepFeedback] = useState('')
   const [renameService, setRenameService] = useState<{ id: string; title: string } | null>(null)
+  const [uiPreferences, setUiPreferences] = useState<NodesUiPreferences>(() => loadNodesUiPreferences())
+  const [dragState, setDragState] = useState<NodeDragState | null>(null)
+  const [groupDragState, setGroupDragState] = useState<GroupDragState | null>(null)
+  const [orderFeedback, setOrderFeedback] = useState('')
+  const dragRef = useRef<NodeDragState | null>(null)
+  const groupDragRef = useRef<GroupDragState | null>(null)
+  const isDragging = dragState !== null || groupDragState !== null
+
+  useEffect(() => {
+    saveNodesUiPreferences(uiPreferences)
+  }, [uiPreferences])
+
+  useEffect(() => {
+    if (!isDragging) return
+    const cancelDrag = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      dragRef.current = null
+      groupDragRef.current = null
+      setDragState(null)
+      setGroupDragState(null)
+      setOrderFeedback('Reorder cancelled.')
+    }
+    document.body.classList.add('is-node-dragging')
+    window.addEventListener('keydown', cancelDrag)
+    return () => {
+      document.body.classList.remove('is-node-dragging')
+      window.removeEventListener('keydown', cancelDrag)
+    }
+  }, [isDragging])
 
   useEffect(() => {
     let mounted = true
@@ -50,7 +117,7 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
       if (progress.nodeId) {
         setTestFeedback((current) => {
           const next = { ...current }
-          if (progress.latencyMs == null) next[progress.nodeId!] = 'No response'
+          if (progress.latencyMs == null) next[progress.nodeId!] = 'Timeout'
           else delete next[progress.nodeId!]
           return next
         })
@@ -66,15 +133,38 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
     }
   }, [])
 
+  const orderedNodesByService = useMemo(() => {
+    const byService = new Map<string, NodeView[]>()
+    for (const service of state.services) {
+      const serviceNodes = state.nodes.filter((node) => node.serviceId === service.id)
+      byService.set(service.id, applyNodeOrder(serviceNodes, uiPreferences.nodeOrderByService[service.id]))
+    }
+    return byService
+  }, [state.nodes, state.services, uiPreferences.nodeOrderByService])
+
+  const orderedServices = useMemo(
+    () => applyNodeOrder(state.services, uiPreferences.serviceOrder),
+    [state.services, uiPreferences.serviceOrder],
+  )
+
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase()
-    if (!query) return state.nodes
-    return state.nodes.filter((node) =>
+    const allNodes = orderedServices.flatMap((service) => orderedNodesByService.get(service.id) ?? [])
+    if (!query) return allNodes
+    return allNodes.filter((node) =>
       [node.displayName, node.serviceTitle, node.protocol].some((value) =>
         value.toLowerCase().includes(query),
       ),
     )
-  }, [search, state.nodes])
+  }, [orderedNodesByService, orderedServices, search])
+
+  const collapsedServiceIds = useMemo(
+    () => new Set(uiPreferences.collapsedServiceIds),
+    [uiPreferences.collapsedServiceIds],
+  )
+  const reorderLocked = search.trim().length > 0
+  const allCollapsed = orderedServices.length > 0
+    && orderedServices.every((service) => collapsedServiceIds.has(service.id))
 
   const run = async (key: string, action: () => Promise<Snapshot>) => {
     setBusy(key)
@@ -122,6 +212,211 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
     }
   }
 
+  const setServiceCollapsed = (serviceId: string, nextCollapsed: boolean) => {
+    setUiPreferences((current) => {
+      const collapsed = new Set(current.collapsedServiceIds)
+      if (nextCollapsed) collapsed.add(serviceId)
+      else collapsed.delete(serviceId)
+      return { ...current, collapsedServiceIds: [...collapsed] }
+    })
+  }
+
+  const setAllServicesCollapsed = (nextCollapsed: boolean) => {
+    setUiPreferences((current) => ({
+      ...current,
+      collapsedServiceIds: nextCollapsed ? state.services.map((service) => service.id) : [],
+    }))
+  }
+
+  const storeNodeOrder = (serviceId: string, nextOrder: string[]) => {
+    setUiPreferences((current) => ({
+      ...current,
+      nodeOrderByService: {
+        ...current.nodeOrderByService,
+        [serviceId]: nextOrder,
+      },
+    }))
+  }
+
+  const storeGroupOrder = (nextOrder: string[]) => {
+    setUiPreferences((current) => ({ ...current, serviceOrder: nextOrder }))
+  }
+
+  const reorderWithKeyboard = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    service: { id: string; title: string },
+    node: NodeView,
+  ) => {
+    if (reorderLocked || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) return
+    event.preventDefault()
+    const serviceNodes = orderedNodesByService.get(service.id) ?? []
+    const currentOrder = serviceNodes.map((item) => item.id)
+    const offset = event.key === 'ArrowUp' ? -1 : 1
+    const index = currentOrder.indexOf(node.id)
+    if (index < 0) return
+    const nextOrder = moveNodeByOffset(currentOrder, node.id, offset)
+    if (sameNodeOrder(currentOrder, nextOrder)) {
+      setOrderFeedback(`${node.displayName} is already ${offset < 0 ? 'first' : 'last'} in ${service.title}.`)
+      return
+    }
+    storeNodeOrder(service.id, nextOrder)
+    const position = nextOrder.indexOf(node.id) + 1
+    setOrderFeedback(`${node.displayName} moved to position ${position} of ${nextOrder.length} in ${service.title}.`)
+    focusReorderControl('data-reorder-node-id', node.id)
+  }
+
+  const startNodeDrag = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    serviceId: string,
+    nodeId: string,
+  ) => {
+    if (reorderLocked || event.button !== 0 || groupDragRef.current) return
+    event.preventDefault()
+    event.currentTarget.focus()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    const next: NodeDragState = {
+      serviceId,
+      nodeId,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      moved: false,
+      targetId: null,
+      placement: null,
+    }
+    dragRef.current = next
+    setDragState(next)
+  }
+
+  const continueNodeDrag = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const current = dragRef.current
+    if (!current || current.pointerId !== event.pointerId) return
+    const moved = current.moved || Math.hypot(event.clientX - current.startX, event.clientY - current.startY) > 3
+    const target = findNodeDropTarget(event.clientX, event.clientY, current)
+    const targetId = target?.nodeId ?? null
+    const placement = target?.placement ?? null
+    if (moved === current.moved && targetId === current.targetId && placement === current.placement) return
+    const next = { ...current, moved, targetId, placement }
+    dragRef.current = next
+    setDragState(next)
+  }
+
+  const finishNodeDrag = (event: ReactPointerEvent<HTMLButtonElement>, commit: boolean) => {
+    const current = dragRef.current
+    if (!current || current.pointerId !== event.pointerId) return
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+    dragRef.current = null
+    setDragState(null)
+    if (!commit) {
+      if (current.moved) setOrderFeedback('Reorder cancelled.')
+      return
+    }
+    if (!current.targetId || !current.placement) {
+      if (current.moved) setOrderFeedback('Reorder cancelled; drop a node inside this service.')
+      return
+    }
+    const serviceNodes = orderedNodesByService.get(current.serviceId) ?? []
+    const currentOrder = serviceNodes.map((node) => node.id)
+    const nextOrder = placeNodeId(currentOrder, current.nodeId, current.targetId, current.placement)
+    if (sameNodeOrder(currentOrder, nextOrder)) {
+      setOrderFeedback('Order unchanged.')
+      focusReorderControl('data-reorder-node-id', current.nodeId)
+      return
+    }
+    storeNodeOrder(current.serviceId, nextOrder)
+    const movedNode = serviceNodes.find((node) => node.id === current.nodeId)
+    const position = nextOrder.indexOf(current.nodeId) + 1
+    setOrderFeedback(`${movedNode?.displayName ?? 'Node'} moved to position ${position} of ${nextOrder.length}.`)
+    focusReorderControl('data-reorder-node-id', current.nodeId)
+  }
+
+  const moveGroupWithKeyboard = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    service: { id: string; title: string },
+  ) => {
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return
+    event.preventDefault()
+    const currentOrder = orderedServices.map((item) => item.id)
+    const offset = event.key === 'ArrowUp' ? -1 : 1
+    const index = currentOrder.indexOf(service.id)
+    if (index < 0) return
+    const nextOrder = moveNodeByOffset(currentOrder, service.id, offset)
+    if (sameNodeOrder(currentOrder, nextOrder)) {
+      setOrderFeedback(`${service.title} group is already ${offset < 0 ? 'first' : 'last'}.`)
+      return
+    }
+    storeGroupOrder(nextOrder)
+    const position = nextOrder.indexOf(service.id) + 1
+    setOrderFeedback(`${service.title} group moved to position ${position} of ${nextOrder.length}.`)
+    focusReorderControl('data-group-reorder-id', service.id)
+  }
+
+  const startGroupDrag = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    serviceId: string,
+  ) => {
+    if (event.button !== 0 || dragRef.current) return
+    event.preventDefault()
+    event.currentTarget.focus()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    const next: GroupDragState = {
+      serviceId,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      moved: false,
+      targetId: null,
+      placement: null,
+    }
+    groupDragRef.current = next
+    setGroupDragState(next)
+  }
+
+  const continueGroupDrag = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const current = groupDragRef.current
+    if (!current || current.pointerId !== event.pointerId) return
+    const moved = current.moved || Math.hypot(event.clientX - current.startX, event.clientY - current.startY) > 3
+    const target = findGroupDropTarget(event.clientX, event.clientY, current)
+    const targetId = target?.serviceId ?? null
+    const placement = target?.placement ?? null
+    if (moved === current.moved && targetId === current.targetId && placement === current.placement) return
+    const next = { ...current, moved, targetId, placement }
+    groupDragRef.current = next
+    setGroupDragState(next)
+  }
+
+  const finishGroupDrag = (event: ReactPointerEvent<HTMLButtonElement>, commit: boolean) => {
+    const current = groupDragRef.current
+    if (!current || current.pointerId !== event.pointerId) return
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+    groupDragRef.current = null
+    setGroupDragState(null)
+    if (!commit) {
+      if (current.moved) setOrderFeedback('Reorder cancelled.')
+      return
+    }
+    if (!current.targetId || !current.placement) {
+      if (current.moved) setOrderFeedback('Group move cancelled; drop on a service header.')
+      return
+    }
+    const currentOrder = orderedServices.map((service) => service.id)
+    const nextOrder = placeNodeId(currentOrder, current.serviceId, current.targetId, current.placement)
+    if (sameNodeOrder(currentOrder, nextOrder)) {
+      setOrderFeedback('Group order unchanged.')
+      focusReorderControl('data-group-reorder-id', current.serviceId)
+      return
+    }
+    storeGroupOrder(nextOrder)
+    const movedService = orderedServices.find((service) => service.id === current.serviceId)
+    const position = nextOrder.indexOf(current.serviceId) + 1
+    setOrderFeedback(`${movedService?.title ?? 'Service'} group moved to position ${position} of ${nextOrder.length}.`)
+    focusReorderControl('data-group-reorder-id', current.serviceId)
+  }
+
   return (
     <div>
       <PageHeader
@@ -155,6 +450,14 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
           </div>
         }
       />
+      <p id="node-order-instructions" className="sr-only">
+        Drag a node handle, or focus it and press Up or Down, to reorder nodes within its service.
+      </p>
+      <p id="group-order-instructions" className="sr-only">
+        Drag a service group handle, or focus it and press Up or Down, to move that service group.
+      </p>
+      <p id="node-order-disabled-hint" className="sr-only">Clear the search to reorder nodes.</p>
+      <p className="sr-only" role="status" aria-live="polite">{orderFeedback}</p>
 
       <Toolbar className="search-row">
         <label className="search-field">
@@ -167,7 +470,19 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
           />
         </label>
         <span className="toolbar-meta">{filtered.length} {filtered.length === 1 ? 'node' : 'nodes'}</span>
+        {state.services.length > 1 ? (
+          <Button
+            variant="quiet"
+            icon={allCollapsed ? 'chevron-down' : 'chevron-up'}
+            className="collapse-all-button"
+            aria-label={allCollapsed ? 'Expand all service node lists' : 'Collapse all service node lists'}
+            onClick={() => setAllServicesCollapsed(!allCollapsed)}
+          >
+            {allCollapsed ? 'Expand all' : 'Collapse all'}
+          </Button>
+        ) : null}
       </Toolbar>
+      {reorderLocked ? <p className="node-order-hint">Clear search to reorder nodes.</p> : null}
       {testingAll && sweepProgress ? (
         <Toolbar className="node-test-progress" role="status" aria-live="polite">
           <span>Testing {sweepProgress.completed} of {sweepProgress.total}</span>
@@ -197,26 +512,26 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
         </Panel>
       ) : (
         <div className="service-stack">
-          {state.services.map((service) => {
+          {orderedServices.map((service) => {
             const nodes = filtered.filter((node) => node.serviceId === service.id)
             const hasAvailableNodes = state.nodes.some((node) => node.serviceId === service.id && !node.missing)
-            const isCollapsed = collapsed[service.id]
+            const isCollapsed = collapsedServiceIds.has(service.id)
+            const serviceTitleId = `service-title-${service.id}`
+            const nodesRegionId = `service-nodes-${service.id}`
             const progress = allowanceProgress(service.allowance)
+            const groupClasses = [
+              'service-card',
+              groupDragState?.serviceId === service.id ? 'is-group-dragging' : '',
+              groupDragState?.targetId === service.id && groupDragState.placement
+                ? `is-group-drop-${groupDragState.placement}`
+                : '',
+            ].filter(Boolean).join(' ')
             return (
-              <Panel className="service-card" key={service.id}>
+              <Panel className={groupClasses} key={service.id} data-service-id={service.id}>
                 <div className="service-head">
-                  <button
-                    type="button"
-                    className="collapse-button"
-                    aria-expanded={!isCollapsed}
-                    aria-label={`${isCollapsed ? 'Expand' : 'Collapse'} ${service.title}`}
-                    onClick={() => setCollapsed((current) => ({ ...current, [service.id]: !isCollapsed }))}
-                  >
-                    <Icon name={isCollapsed ? 'chevron-right' : 'chevron-down'} size={22} />
-                  </button>
                   <div className="service-title-wrap">
                     <div className="service-title-line">
-                      <h2>{service.title}</h2>
+                      <h2 id={serviceTitleId}>{service.title}</h2>
                       {service.sourceType === 'subscription' ? (
                         <SourceBadge>Subscription</SourceBadge>
                       ) : (
@@ -250,6 +565,29 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
                         Refresh
                       </Button>
                     ) : null}
+                    <IconButton
+                      icon="grip"
+                      label={`Move ${service.title} group`}
+                      className="service-drag-handle"
+                      data-group-reorder-id={service.id}
+                      draggable={false}
+                      aria-describedby="group-order-instructions"
+                      aria-keyshortcuts="ArrowUp ArrowDown"
+                      title={`Move ${service.title} group with the mouse, or focus and press Up or Down`}
+                      onPointerDown={(event) => startGroupDrag(event, service.id)}
+                      onPointerMove={continueGroupDrag}
+                      onPointerUp={(event) => finishGroupDrag(event, true)}
+                      onPointerCancel={(event) => finishGroupDrag(event, false)}
+                      onKeyDown={(event) => moveGroupWithKeyboard(event, service)}
+                    />
+                    <IconButton
+                      icon={isCollapsed ? 'chevron-down' : 'chevron-up'}
+                      label={`${isCollapsed ? 'Expand' : 'Collapse'} ${service.title} nodes`}
+                      className="service-collapse-button"
+                      aria-expanded={!isCollapsed}
+                      aria-controls={nodesRegionId}
+                      onClick={() => setServiceCollapsed(service.id, !isCollapsed)}
+                    />
                   </div>
                 </div>
                 {progress !== null ? (
@@ -264,38 +602,72 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
                 {snapshot.runtime.pendingReconnectServices.includes(service.id) ? (
                   <p className="service-refresh-notice">A selected node was refreshed. The running session keeps its existing endpoint until reconnect.</p>
                 ) : null}
-                {!isCollapsed ? (
-                  <div className="node-table-wrap">
-                    {nodes.length === 0 ? (
-                      <p className="muted node-empty">No nodes match this search.</p>
-                    ) : (
-                      <table className="node-table">
-                        <thead>
-                          <tr>
-                            <th scope="col">Node</th>
-                            <th scope="col">Protocol</th>
-                            <th scope="col">Latency</th>
-                            <th scope="col">State</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {nodes.map((node) => (
-                            <tr key={node.id} data-node-id={node.id} className={node.missing ? 'is-missing' : ''}>
+                <div
+                  className="node-table-wrap"
+                  id={nodesRegionId}
+                  role="region"
+                  aria-labelledby={serviceTitleId}
+                  hidden={isCollapsed}
+                >
+                  {nodes.length === 0 ? (
+                    <p className="muted node-empty">No nodes match this search.</p>
+                  ) : (
+                    <table className="node-table" data-service-id={service.id} aria-label={`${service.title} nodes`}>
+                      <thead>
+                        <tr>
+                          <th scope="col" className="node-order-column"><span className="sr-only">Reorder</span></th>
+                          <th scope="col">Node</th>
+                          <th scope="col">Protocol</th>
+                          <th scope="col">Latency / State</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {nodes.map((node) => {
+                          const rowClassName = [
+                            node.missing ? 'is-missing' : '',
+                            dragState?.nodeId === node.id ? 'is-dragging' : '',
+                            dragState?.serviceId === service.id
+                              && dragState.targetId === node.id
+                              && dragState.placement
+                              ? `is-drop-${dragState.placement}`
+                              : '',
+                          ].filter(Boolean).join(' ')
+                          return (
+                            <tr key={node.id} data-node-id={node.id} className={rowClassName}>
+                              <td className="node-order-cell">
+                                <IconButton
+                                  icon="grip"
+                                  label={`Reorder ${node.displayName} in ${service.title}`}
+                                  className="node-drag-handle"
+                                  data-reorder-node-id={node.id}
+                                  draggable={false}
+                                  disabled={reorderLocked}
+                                  aria-describedby={reorderLocked ? 'node-order-disabled-hint' : 'node-order-instructions'}
+                                  aria-keyshortcuts="ArrowUp ArrowDown"
+                                  title={reorderLocked
+                                    ? 'Clear search to reorder nodes'
+                                    : `Reorder ${node.displayName} with the mouse, or focus and press Up or Down`}
+                                  onPointerDown={(event) => startNodeDrag(event, service.id, node.id)}
+                                  onPointerMove={continueNodeDrag}
+                                  onPointerUp={(event) => finishNodeDrag(event, true)}
+                                  onPointerCancel={(event) => finishNodeDrag(event, false)}
+                                  onKeyDown={(event) => reorderWithKeyboard(event, service, node)}
+                                />
+                              </td>
                               <td><strong>{node.displayName}</strong></td>
                               <td>{node.protocol}</td>
                               <td>
-                                <div className="node-latency-cell">
-                                  <LatencyValue node={node} now={now} />
-                                  {testFeedback[node.id] ? (
-                                    <span className="node-test-feedback" role="status">{testFeedback[node.id]}</span>
-                                  ) : null}
-                                  {!node.missing ? (
+                                {node.missing ? (
+                                  <SourceBadge tone="red">Missing · choose replacement</SourceBadge>
+                                ) : (
+                                  <div className="node-latency-cell">
                                     <Button
                                       variant="quiet"
                                       className="node-test-button"
                                       busy={testingNodeId === node.id}
                                       disabled={!snapshot.runtime.vpnActive || testingNodeId !== null || testingAll || busy !== null}
                                       aria-label={`Test ${node.displayName} latency`}
+                                      aria-describedby={`node-latency-${node.id}`}
                                       title={snapshot.runtime.vpnActive ? `Test ${node.displayName} latency` : 'Connect Clashfork to test node latency'}
                                       onClick={() => {
                                         setTestingNodeId(node.id)
@@ -305,31 +677,31 @@ export function NodesPage({ snapshot, onSnapshot, onError }: Props) {
                                           return next
                                         })
                                         void api.testNode(node.id).then(onSnapshot).catch((error: unknown) => {
-                                          setTestFeedback((current) => ({ ...current, [node.id]: nodeTestFailureText(error) }))
+                                          setTestFeedback((current) => ({ ...current, [node.id]: nodeTestFailureText(error, 'Timeout') }))
                                         }).finally(() => setTestingNodeId(null))
                                       }}
                                     >
-                                      Test
+                                      <span id={`node-latency-${node.id}`} role="status">
+                                        {testingNodeId === node.id ? 'Testing…' : testFeedback[node.id] ? (
+                                          <span className="node-test-feedback">{testFeedback[node.id]}</span>
+                                        ) : (
+                                          <LatencyValue node={node} now={now} />
+                                        )}
+                                      </span>
                                     </Button>
-                                  ) : null}
-                                </div>
-                              </td>
-                              <td>
-                                {node.missing ? (
-                                  <SourceBadge tone="red">Missing · choose replacement</SourceBadge>
-                                ) : node.omittedOnce ? (
-                                  <SourceBadge tone="amber">Omitted once · awaiting confirmation</SourceBadge>
-                                ) : (
-                                  <SourceBadge tone="accent" dot>Available</SourceBadge>
+                                    {node.omittedOnce ? (
+                                      <SourceBadge tone="amber">Omitted once · awaiting confirmation</SourceBadge>
+                                    ) : null}
+                                  </div>
                                 )}
                               </td>
                             </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-                ) : null}
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
               </Panel>
             )
           })}
@@ -467,9 +839,58 @@ function formatProgress(allowance: ImportPreview['allowance']): string {
   return `${formatBytes(allowance.used)} of ${formatBytes(allowance.total)}`
 }
 
-function nodeTestFailureText(error: unknown): string {
+function nodeTestFailureText(error: unknown, fallback = 'No response'): string {
   const message = error instanceof Error ? error.message : String(error)
   if (message.includes('Connect Clashfork')) return 'Connect Clashfork to test'
   if (message.includes('Reconnect Clashfork')) return 'Reconnect to test this update'
-  return 'No response'
+  return fallback
+}
+
+function findNodeDropTarget(
+  clientX: number,
+  clientY: number,
+  drag: Pick<NodeDragState, 'serviceId' | 'nodeId'>,
+): { nodeId: string; placement: NodeDropPlacement } | null {
+  const element = document.elementFromPoint(clientX, clientY)
+  const row = element instanceof Element ? element.closest<HTMLTableRowElement>('tr[data-node-id]') : null
+  const table = row?.closest<HTMLTableElement>('table[data-service-id]')
+  if (!row || !table || table.dataset.serviceId !== drag.serviceId) return null
+  const nodeId = row.dataset.nodeId
+  if (!nodeId || nodeId === drag.nodeId) return null
+  const bounds = row.getBoundingClientRect()
+  return {
+    nodeId,
+    placement: clientY < bounds.top + bounds.height / 2 ? 'before' : 'after',
+  }
+}
+
+function findGroupDropTarget(
+  clientX: number,
+  clientY: number,
+  drag: Pick<GroupDragState, 'serviceId'>,
+): { serviceId: string; placement: NodeDropPlacement } | null {
+  const element = document.elementFromPoint(clientX, clientY)
+  const header = element instanceof Element ? element.closest<HTMLElement>('.service-head') : null
+  const card = header?.closest<HTMLElement>('.service-card')
+  const serviceId = card?.dataset.serviceId
+  if (!header || !serviceId || serviceId === drag.serviceId) return null
+  const bounds = header.getBoundingClientRect()
+  return {
+    serviceId,
+    placement: clientY < bounds.top + bounds.height / 2 ? 'before' : 'after',
+  }
+}
+
+function focusReorderControl(
+  attribute: 'data-reorder-node-id' | 'data-group-reorder-id',
+  id: string,
+) {
+  requestAnimationFrame(() => {
+    for (const control of document.querySelectorAll<HTMLButtonElement>(`[${attribute}]`)) {
+      if (control.getAttribute(attribute) === id) {
+        control.focus()
+        return
+      }
+    }
+  })
 }

@@ -1,8 +1,15 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api'
-import { useLiveRates, useNowMs, useRatePoints } from '../hooks'
+import { useNowMs } from '../hooks'
+import { RATE_WINDOW_SECONDS, useRateRecorderSnapshot } from '../lib/rateRecorder'
+import {
+  nextStableRateScaleIndex,
+  rateChartGeometry,
+  rateScaleFromIndex,
+  rateScaleIndex,
+} from '../lib/rateChart'
 import { SelectedNodeLatency } from '../components/NodeLatency'
-import { formatBytes, formatRate } from '../lib/format'
+import { formatRate } from '../lib/format'
 import type { Mode, Snapshot } from '../types'
 import {
   Button,
@@ -28,8 +35,7 @@ export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
   const { state, runtime } = snapshot
   const now = useNowMs(1000)
   const selectedGlobalNode = state.nodes.find((node) => node.id === state.selection.globalNodeId)
-  const live = useLiveRates(true)
-  const points = useRatePoints(live)
+  const { latest: live, points } = useRateRecorderSnapshot()
   const [busy, setBusy] = useState<string | null>(null)
   const [presetOpen, setPresetOpen] = useState(false)
   const [presetName, setPresetName] = useState('')
@@ -106,33 +112,33 @@ export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
     }
   }
 
-  const chart = useMemo(() => {
-    const rawMax = Math.max(0, ...points.flatMap((point) => [point.download, point.upload]))
-    const max = Math.max(rawMax, 1024 * 1024)
-    const width = 820
-    const height = 150
-    const latestAt = points.at(-1)?.at ?? 0
-    const coordinates = (key: 'download' | 'upload') => points.map((point) => {
-      const age = latestAt - point.at
-      const x = 4 + (width - 8) * (1 - Math.max(0, Math.min(60, age)) / 60)
-      const y = height - (point[key] / max) * (height - 10)
-      return { x, y }
-    })
-    const path = (key: 'download' | 'upload') => {
-      const values = coordinates(key)
-      if (values.length === 0) return `M ${width} ${height}`
-      return values.map(({ x, y }, index) => `${index === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`).join(' ')
+  const nowSeconds = now / 1000
+  const visiblePoints = useMemo(
+    () => points.filter((point) => point.at <= nowSeconds + 1 && nowSeconds - point.at <= RATE_WINDOW_SECONDS),
+    [nowSeconds, points],
+  )
+  const rawMax = useMemo(
+    () => Math.max(0, ...visiblePoints.flatMap((point) => [point.download, point.upload])),
+    [visiblePoints],
+  )
+  const desiredScaleIndex = useMemo(() => rateScaleIndex(rawMax), [rawMax])
+  const [scaleIndex, setScaleIndex] = useState(desiredScaleIndex)
+  const scaleChangedAt = useRef(nowSeconds)
+  useEffect(() => {
+    const next = nextStableRateScaleIndex(
+      scaleIndex,
+      desiredScaleIndex,
+      nowSeconds - scaleChangedAt.current,
+    )
+    if (next !== scaleIndex) {
+      scaleChangedAt.current = nowSeconds
+      setScaleIndex(next)
     }
-    const download = coordinates('download')
-    const area = download.length < 2
-      ? ''
-      : `M ${download[0].x.toFixed(1)} ${height} ${download.map(({ x, y }) => `L ${x.toFixed(1)} ${y.toFixed(1)}`).join(' ')} L ${download.at(-1)!.x.toFixed(1)} ${height} Z`
-    const latestPoint = points.length === 1
-      ? { download: download[0], upload: coordinates('upload')[0] }
-      : null
-    const labels = [1, 0.75, 0.5, 0.25, 0].map((fraction) => formatBytes(max * fraction, 0) + '/s')
-    return { path, area, labels, max, latestPoint }
-  }, [points])
+  }, [desiredScaleIndex, nowSeconds, scaleIndex])
+  const chart = useMemo(
+    () => rateChartGeometry(points, nowSeconds, rateScaleFromIndex(scaleIndex)),
+    [nowSeconds, points, scaleIndex],
+  )
 
   return (
     <div className="dashboard-page">
@@ -261,7 +267,17 @@ export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
                 <strong className="is-upload">{runtime.vpnActive && live.available ? formatRate(live.proxyUploadRate) : '— B/s'}</strong>
               </div>
             </div>
-            <div className="traffic-chart" role="img" aria-label="Recent proxy download and upload rates">
+            <div
+              className="traffic-chart"
+              role="img"
+              aria-label="Recent proxy download and upload rates"
+              data-rate-points={chart.points.length}
+              data-rate-window={RATE_WINDOW_SECONDS}
+              data-rate-scale={chart.scale}
+              data-rate-groups={chart.groups}
+              data-rate-first-x={chart.firstX.toFixed(1)}
+              data-rate-last-x={chart.lastX.toFixed(1)}
+            >
               <div className="chart-y-labels" aria-hidden="true">
                 {chart.labels.map((label, index) => <span key={index}>{label}</span>)}
               </div>
@@ -277,8 +293,8 @@ export function DashboardPage({ snapshot, onSnapshot, onError }: Props) {
                     <line key={line} x1="0" x2="820" y1={line * 37.5} y2={line * 37.5} className="chart-gridline" />
                   ))}
                   {chart.area ? <path d={chart.area} className="chart-area" fill="url(#traffic-fill)" /> : null}
-                  <path d={chart.path('download')} className="chart-line chart-download" fill="none" />
-                  <path d={chart.path('upload')} className="chart-line chart-upload" fill="none" />
+                  <path d={chart.downloadPath} className="chart-line chart-download" fill="none" />
+                  <path d={chart.uploadPath} className="chart-line chart-upload" fill="none" />
                   {chart.latestPoint ? (
                     <>
                       <circle cx={chart.latestPoint.download.x} cy={chart.latestPoint.download.y} r="4" className="chart-point chart-point-download" />

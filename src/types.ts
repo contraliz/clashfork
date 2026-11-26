@@ -151,6 +151,11 @@ export interface PreviewNode {
   protocol: string
 }
 
+export interface SaveExportResult {
+  canceled: boolean
+  fileName: string | null
+}
+
 export interface ImportPreview {
   id: string
   sourceType: 'subscription' | 'link' | 'manual'
@@ -226,7 +231,7 @@ export interface HistoryReport {
   gapMinutes: number
   bars: HistoryBar[]
   rows: HistoryRow[]
-  breakdown: 'app' | 'customGroup' | 'route'
+  breakdown: 'app' | 'customGroup' | 'rule' | 'route'
   availableApps: string[]
 }
 
@@ -258,7 +263,7 @@ export interface SaveMatchGroupInput {
 
 export interface HistoryInput {
   range: 'today' | '7d' | '30d'
-  breakdown: 'app' | 'customGroup' | 'route'
+  breakdown: 'app' | 'customGroup' | 'rule' | 'route'
   routeFilter?: 'proxy' | 'direct' | null
   subjectFilter?: HistorySubjectFilter | null
 }

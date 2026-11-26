@@ -1,4 +1,5 @@
 use crate::{
+    export::{self, SaveExportResult},
     models::{
         AddNodesInput, AppState, CustomAppGroup, DiagnosticEntry, HistoryInput, HistoryReport,
         ImportPreview, LiveRates, LiveSnapshot, NodeTestSummary, SaveMatchGroupInput,
@@ -7,7 +8,7 @@ use crate::{
     runtime::AppRuntime,
 };
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State};
 
 type Runtime<'a> = State<'a, Arc<AppRuntime>>;
 
@@ -119,6 +120,22 @@ pub async fn save_ruleset(
     input: SaveRulesetInput,
 ) -> Result<Snapshot, String> {
     runtime.save_ruleset(input).await.map_err(command_error)
+}
+
+#[tauri::command]
+pub fn save_routing_export(
+    app: tauri::AppHandle,
+    suggested_name: String,
+    contents: String,
+) -> Result<SaveExportResult, String> {
+    #[cfg(windows)]
+    let owner = app
+        .get_webview_window("main")
+        .and_then(|window| window.hwnd().ok())
+        .map(|handle| handle.0 as isize);
+    #[cfg(not(windows))]
+    let owner = None;
+    export::save_routing_export(owner, &suggested_name, &contents).map_err(command_error)
 }
 
 #[tauri::command]

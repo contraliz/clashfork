@@ -1,0 +1,267 @@
+{
+  "format": "clashfork-routing",
+  "version": 1,
+  "type": "ruleset",
+  "name": "Mainland China · Proxy selected services",
+  "rules": [
+    {
+      "name": "Google and YouTube",
+      "conditions": [
+        {
+          "kind": "domain_suffix",
+          "value": "google.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "googleapis.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "gstatic.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "googleusercontent.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "youtube.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "youtube-nocookie.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "youtu.be"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "ytimg.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "googlevideo.com"
+        }
+      ],
+      "destination": {
+        "kind": "proxy",
+        "proxyRef": "proxy-main",
+        "label": "Proxy node"
+      }
+    },
+    {
+      "name": "OpenAI, ChatGPT, and Codex",
+      "conditions": [
+        {
+          "kind": "domain_suffix",
+          "value": "openai.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "chatgpt.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "oaiusercontent.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "oaistatic.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "oaistatsig.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "openaimerge.com"
+        },
+        {
+          "kind": "domain",
+          "value": "challenges.cloudflare.com"
+        },
+        {
+          "kind": "domain",
+          "value": "setup.workos.com"
+        },
+        {
+          "kind": "domain",
+          "value": "forwarder.workos.com"
+        },
+        {
+          "kind": "domain",
+          "value": "frontend-apps-multi-region.workos.com"
+        },
+        {
+          "kind": "domain",
+          "value": "cdn.workos.com"
+        },
+        {
+          "kind": "domain",
+          "value": "images.workoscdn.com"
+        },
+        {
+          "kind": "domain",
+          "value": "workos.imgix.net"
+        }
+      ],
+      "destination": {
+        "kind": "proxy",
+        "proxyRef": "proxy-main",
+        "label": "Proxy node"
+      }
+    },
+    {
+      "name": "GitHub",
+      "conditions": [
+        {
+          "kind": "domain_suffix",
+          "value": "github.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "githubusercontent.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "githubassets.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "githubcopilot.com"
+        }
+      ],
+      "destination": {
+        "kind": "proxy",
+        "proxyRef": "proxy-main",
+        "label": "Proxy node"
+      }
+    },
+    {
+      "name": "OpenCode",
+      "conditions": [
+        {
+          "kind": "domain_suffix",
+          "value": "opencode.ai"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "models.dev"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "models.opencode.ai"
+        }
+      ],
+      "destination": {
+        "kind": "proxy",
+        "proxyRef": "proxy-main",
+        "label": "Proxy node"
+      }
+    },
+    {
+      "name": "Social platforms",
+      "conditions": [
+        {
+          "kind": "domain_suffix",
+          "value": "facebook.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "instagram.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "threads.net"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "x.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "twitter.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "fbcdn.net"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "cdninstagram.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "twimg.com"
+        }
+      ],
+      "destination": {
+        "kind": "proxy",
+        "proxyRef": "proxy-main",
+        "label": "Proxy node"
+      }
+    },
+    {
+      "name": "Messaging and communities",
+      "conditions": [
+        {
+          "kind": "domain_suffix",
+          "value": "whatsapp.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "whatsapp.net"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "telegram.org"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "t.me"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "discord.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "discord.gg"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "discordapp.com"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "discordapp.net"
+        }
+      ],
+      "destination": {
+        "kind": "proxy",
+        "proxyRef": "proxy-main",
+        "label": "Proxy node"
+      }
+    },
+    {
+      "name": "Wikipedia",
+      "conditions": [
+        {
+          "kind": "domain_suffix",
+          "value": "wikipedia.org"
+        },
+        {
+          "kind": "domain_suffix",
+          "value": "wikimedia.org"
+        }
+      ],
+      "destination": {
+        "kind": "proxy",
+        "proxyRef": "proxy-main",
+        "label": "Proxy node"
+      }
+    }
+  ],
+  "miscellaneous": "direct"
+}

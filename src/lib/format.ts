@@ -17,6 +17,19 @@ export function formatRate(value: number): string {
   return `${formatBytes(value)}/s`
 }
 
+export function formatRateTick(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 B/s'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let amount = value
+  let unit = 0
+  while (amount >= 1023.5 && unit < units.length - 1) {
+    amount /= 1024
+    unit += 1
+  }
+  const digits = amount >= 100 ? 0 : 1
+  return `${Number(amount.toFixed(digits))} ${units[unit]}/s`
+}
+
 export function allowanceSummary(allowance: Allowance): string {
   switch (allowance.kind) {
     case 'full':

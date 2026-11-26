@@ -25,12 +25,63 @@ pub struct ControllerConfig {
     pub dns_port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleAttribution {
+    pub rule_id: String,
+    pub label: String,
+}
+
+pub type RuleAttributionMap = BTreeMap<String, Option<RuleAttribution>>;
+
 #[derive(Debug, Clone)]
 pub struct CompiledRuntime {
     pub yaml: String,
     pub node_routes: BTreeMap<String, String>,
-    pub rule_groups: BTreeMap<String, String>,
+    pub rule_attributions: RuleAttributionMap,
     pub node_fingerprints: BTreeMap<String, String>,
+}
+
+pub fn rule_match_key(rule: &str, payload: &str) -> String {
+    let kind: String = rule
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    format!("{kind}|{}", payload.trim().to_ascii_lowercase())
+}
+
+fn condition_rule_type(kind: ConditionKind) -> &'static str {
+    match kind {
+        ConditionKind::ProcessName => "PROCESS-NAME",
+        ConditionKind::ProcessPath => "PROCESS-PATH",
+        ConditionKind::Domain => "DOMAIN",
+        ConditionKind::DomainSuffix => "DOMAIN-SUFFIX",
+        ConditionKind::Ipv4Cidr => "IP-CIDR",
+        ConditionKind::Ipv6Cidr => "IP-CIDR6",
+    }
+}
+
+fn add_rule_attribution(
+    map: &mut RuleAttributionMap,
+    rule: &str,
+    payload: &str,
+    attribution: &RuleAttribution,
+) {
+    let key = rule_match_key(rule, payload);
+    match map.entry(key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(Some(attribution.clone()));
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            if entry
+                .get()
+                .as_ref()
+                .is_some_and(|existing| existing.rule_id != attribution.rule_id)
+            {
+                entry.insert(None);
+            }
+        }
+    }
 }
 
 /// A resident, inert core used to avoid a cold process start on the user's Connect action.
@@ -353,8 +404,15 @@ fn compile_conditions(
 }
 
 pub fn compile_rule_lines(state: &AppState, selection: &Selection) -> Result<Vec<String>> {
+    Ok(compile_policy(state, selection)?.0)
+}
+
+fn compile_policy(
+    state: &AppState,
+    selection: &Selection,
+) -> Result<(Vec<String>, RuleAttributionMap)> {
     match selection.mode {
-        Mode::Global => Ok(Vec::new()),
+        Mode::Global => Ok((Vec::new(), BTreeMap::new())),
         Mode::Rule => {
             let ruleset = active_ruleset(state, selection)?;
             validate_ruleset(ruleset, state)?;
@@ -364,6 +422,7 @@ pub fn compile_rule_lines(state: &AppState, selection: &Selection) -> Result<Vec
                 .map(|node| (node.id.as_str(), node))
                 .collect();
             let mut rules = Vec::new();
+            let mut attributions = RuleAttributionMap::new();
             for entry in &ruleset.entries {
                 let conditions = if entry.conditions.is_empty() {
                     &state
@@ -375,6 +434,29 @@ pub fn compile_rule_lines(state: &AppState, selection: &Selection) -> Result<Vec
                 } else {
                     &entry.conditions
                 };
+                let label = if entry.name.trim().is_empty() {
+                    state
+                        .match_groups
+                        .iter()
+                        .find(|group| group.id == entry.match_group_id)
+                        .map(|group| group.name.clone())
+                        .unwrap_or_else(|| "Rule".to_owned())
+                } else {
+                    entry.name.trim().to_owned()
+                };
+                let attribution = RuleAttribution {
+                    rule_id: format!("{}:{}", ruleset.id, entry.id),
+                    label,
+                };
+                for condition in conditions {
+                    let value = validate_condition(condition)?;
+                    add_rule_attribution(
+                        &mut attributions,
+                        condition_rule_type(condition.kind),
+                        &value,
+                        &attribution,
+                    );
+                }
                 match &entry.destination {
                     Destination::Direct => {
                         compile_conditions(conditions, "DIRECT", false, &mut rules)?;
@@ -393,23 +475,30 @@ pub fn compile_rule_lines(state: &AppState, selection: &Selection) -> Result<Vec
                     }
                 }
             }
-            rules.push(format!(
-                "MATCH,{}",
-                match &ruleset.miscellaneous {
-                    crate::models::Miscellaneous::Direct => "DIRECT".to_owned(),
-                    crate::models::Miscellaneous::Block => "REJECT".to_owned(),
-                    crate::models::Miscellaneous::Node { node_id } => {
-                        let node = nodes
-                            .get(node_id.as_str())
-                            .context("The catch-all references a missing node.")?;
-                        if node.missing {
-                            bail!("The catch-all references a node missing from its service.");
-                        }
-                        node.core_name.clone()
+            let catch_all_target = match &ruleset.miscellaneous {
+                crate::models::Miscellaneous::Direct => "DIRECT".to_owned(),
+                crate::models::Miscellaneous::Block => "REJECT".to_owned(),
+                crate::models::Miscellaneous::Node { node_id } => {
+                    let node = nodes
+                        .get(node_id.as_str())
+                        .context("The catch-all references a missing node.")?;
+                    if node.missing {
+                        bail!("The catch-all references a node missing from its service.");
                     }
+                    node.core_name.clone()
                 }
-            ));
-            Ok(rules)
+            };
+            add_rule_attribution(
+                &mut attributions,
+                "MATCH",
+                "",
+                &RuleAttribution {
+                    rule_id: format!("{}:__everything_else__", ruleset.id),
+                    label: "Everything else".to_owned(),
+                },
+            );
+            rules.push(format!("MATCH,{catch_all_target}"));
+            Ok((rules, attributions))
         }
     }
 }
@@ -526,24 +615,7 @@ pub fn build_runtime_yaml(
         }
     };
 
-    let rules = compile_rule_lines(state, selection)?;
-    let rule_groups = if selection.mode == Mode::Rule {
-        let ruleset = active_ruleset(state, selection)?;
-        ruleset
-            .entries
-            .iter()
-            .filter_map(|entry| match &entry.destination {
-                Destination::Node { node_id } => state
-                    .nodes
-                    .iter()
-                    .find(|node| &node.id == node_id)
-                    .map(|node| (node.core_name.clone(), entry.match_group_id.clone())),
-                _ => None,
-            })
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
+    let (rules, rule_attributions) = compile_policy(state, selection)?;
 
     let mut root = Mapping::new();
     map_insert(&mut root, "mixed-port", Value::from(0));
@@ -688,7 +760,7 @@ pub fn build_runtime_yaml(
     Ok(CompiledRuntime {
         yaml,
         node_routes,
-        rule_groups,
+        rule_attributions,
         node_fingerprints,
     })
 }
@@ -861,6 +933,105 @@ mod tests {
         secrets.nodes.insert("node-2".into(), Value::Mapping(first));
         let selection = state.selection.clone();
         (state, secrets, selection)
+    }
+
+    #[test]
+    fn rule_attributions_follow_emitted_conditions_and_catch_all() {
+        let (mut state, _, selection) = base();
+        state.rulesets[0].entries = vec![
+            RulesetEntry {
+                id: "entry-google".into(),
+                match_group_id: String::new(),
+                name: "Google".into(),
+                conditions: vec![MatchCondition {
+                    id: "google".into(),
+                    kind: ConditionKind::DomainSuffix,
+                    value: "google.com".into(),
+                }],
+                destination: Destination::Node {
+                    node_id: "node-1".into(),
+                },
+            },
+            RulesetEntry {
+                id: "entry-youtube".into(),
+                match_group_id: String::new(),
+                name: "YouTube".into(),
+                conditions: vec![MatchCondition {
+                    id: "youtube".into(),
+                    kind: ConditionKind::DomainSuffix,
+                    value: "youtube.com".into(),
+                }],
+                destination: Destination::Node {
+                    node_id: "node-1".into(),
+                },
+            },
+            RulesetEntry {
+                id: "entry-direct".into(),
+                match_group_id: String::new(),
+                name: "Local direct".into(),
+                conditions: vec![MatchCondition {
+                    id: "lan".into(),
+                    kind: ConditionKind::Ipv4Cidr,
+                    value: "192.168.0.0/16".into(),
+                }],
+                destination: Destination::Direct,
+            },
+        ];
+        state.rulesets[0].miscellaneous = Miscellaneous::Direct;
+        let (_, attributions) = compile_policy(&state, &selection).unwrap();
+        let google = attributions
+            .get(&rule_match_key("DomainSuffix", "google.com"))
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        let youtube = attributions
+            .get(&rule_match_key("DomainSuffix", "youtube.com"))
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(google.label, "Google");
+        assert_eq!(youtube.label, "YouTube");
+        assert_ne!(google.rule_id, youtube.rule_id);
+        assert_eq!(
+            attributions
+                .get(&rule_match_key("IPCIDR", "192.168.0.0/16"))
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .label,
+            "Local direct"
+        );
+        assert_eq!(
+            attributions
+                .get(&rule_match_key("Match", ""))
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .label,
+            "Everything else"
+        );
+
+        state.rulesets[0].entries.push(RulesetEntry {
+            id: "entry-google-duplicate".into(),
+            match_group_id: String::new(),
+            name: "Google duplicate".into(),
+            conditions: vec![MatchCondition {
+                id: "google-duplicate".into(),
+                kind: ConditionKind::DomainSuffix,
+                value: "google.com".into(),
+            }],
+            destination: Destination::Node {
+                node_id: "node-1".into(),
+            },
+        });
+        let (_, ambiguous) = compile_policy(&state, &selection).unwrap();
+        assert!(
+            ambiguous
+                .get(&rule_match_key("DomainSuffix", "google.com"))
+                .unwrap()
+                .is_none(),
+            "duplicate emitted conditions must stay unattributed"
+        );
     }
 
     #[test]
@@ -1147,6 +1318,128 @@ mod tests {
             resolved,
             "the stock core did not fall back to the live local DNS fixture"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the bundled Mihomo executable"]
+    async fn stock_mihomo_reports_rule_and_payload_metadata() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            process::{Child, Command, Stdio},
+            time::Duration,
+        };
+
+        struct RunningCore(Child);
+        impl Drop for RunningCore {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let server_port = server.local_addr().unwrap().port();
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = server.accept() {
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                std::thread::sleep(Duration::from_millis(1500));
+                let body = "ok";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+
+        let mixed = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mixed_port = mixed.local_addr().unwrap().port();
+        drop(mixed);
+        let controller_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let controller_port = controller_listener.local_addr().unwrap().port();
+        drop(controller_listener);
+
+        let config = format!(
+            "mixed-port: {mixed_port}\nallow-lan: false\nmode: rule\nlog-level: warning\nipv6: false\nexternal-controller: 127.0.0.1:{controller_port}\nsecret: fixture-secret\nhosts:\n  rule-fixture.test: 127.0.0.1\nrules:\n  - DOMAIN-SUFFIX,rule-fixture.test,DIRECT\n  - DOMAIN-SUFFIX,other-fixture.test,DIRECT\n  - MATCH,REJECT\n"
+        );
+        let core =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/clashfork-core.exe");
+        let scratch = tempfile::tempdir().unwrap();
+        let config_path = scratch.path().join("metadata-fixture.yaml");
+        std::fs::write(&config_path, config).unwrap();
+        let _child = RunningCore(
+            Command::new(core)
+                .arg("-d")
+                .arg(scratch.path())
+                .arg("-f")
+                .arg(&config_path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+
+        let controller = crate::controller::CoreController::new(
+            controller_port,
+            "fixture-secret".into(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        );
+        crate::service_client::wait_ready_config(&controller, "rule", false)
+            .await
+            .unwrap();
+
+        let proxy = reqwest::Proxy::http(format!("http://127.0.0.1:{mixed_port}")).unwrap();
+        let proxied = reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(Duration::from_secs(8))
+            .build()
+            .unwrap();
+        let request = tokio::spawn(async move {
+            let _ = proxied
+                .get(format!("http://rule-fixture.test:{server_port}/"))
+                .send()
+                .await;
+        });
+
+        let mut matched = None;
+        for _ in 0..40 {
+            if let Ok(value) = controller.connections().await
+                && let Some(connection) = value
+                    .get("connections")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|connections| {
+                        connections.iter().find(|connection| {
+                            connection
+                                .pointer("/metadata/host")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("rule-fixture.test")
+                        })
+                    })
+            {
+                matched = Some(connection.clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let connection = matched.expect("stock core did not expose the proxied fixture connection");
+        let rule = connection
+            .get("rule")
+            .and_then(serde_json::Value::as_str)
+            .expect("stock core connection must include the matched rule type");
+        let payload = connection
+            .get("rulePayload")
+            .and_then(serde_json::Value::as_str)
+            .expect("stock core connection must include the matched rule payload");
+        assert_eq!(
+            rule_match_key(rule, payload),
+            rule_match_key("DOMAIN-SUFFIX", "rule-fixture.test"),
+            "actual Mihomo rule metadata must normalize onto the emitted policy key"
+        );
+        request.abort();
+        let _ = server_thread.join();
     }
 
     #[test]

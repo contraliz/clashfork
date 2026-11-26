@@ -5,7 +5,7 @@ Clashfork is a Windows 11 desktop client for [Mihomo](https://github.com/MetaCub
 ## Connect
 
 1. Open **Nodes → Add Nodes**, paste a subscription or supported node link, and review the import preview. Refresh a service to update its nodes and provider-reported allowance.
-2. Use **Rulesets** to create match groups and decide where each group routes. Set **Miscellaneous** to Direct or Block.
+2. Use **Rulesets** to create ordered rules with their own conditions and destinations, including Direct, Block, or a local node for **Everything else**.
 3. On the **Dashboard**, choose a ruleset in Rule mode or a node in Global mode. Turn the VPN on. Both modes use TUN. Closing the window keeps Clashfork in the tray; use **Quit Clashfork** in the tray to stop the VPN and exit.
 4. Switch rulesets on the Dashboard while connected to apply a new routing policy. The VPN stays on when the change succeeds.
 
@@ -20,7 +20,7 @@ npm ci
 npm run build
 ```
 
-The build stages the pinned, checksum-verified Mihomo executable and builds the three Clashfork service binaries before Tauri packages the installer. The expected artifact is `target/release/bundle/nsis/Clashfork_1.0.4_x64-setup.exe`. Installing the bundle requires administrator access to register the fork-owned TUN service.
+The build stages the pinned, checksum-verified Mihomo executable and builds the three Clashfork service binaries before Tauri packages the installer. The expected artifact is `target/release/bundle/nsis/Clashfork_1.0.11_x64-setup.exe`. Installing the bundle requires administrator access to register the fork-owned TUN service.
 
 ## Data and security boundaries
 

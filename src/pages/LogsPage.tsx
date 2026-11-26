@@ -1,8 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api'
 import { formatBytes, formatTime, prettyDateRange } from '../lib/format'
 import { sortDiagnosticsNewestFirst } from '../lib/diagnostics'
 import { isDocumentVisible, useDocumentVisible } from '../hooks'
+import {
+  resetLogsFilters,
+  updateLogsSession,
+  useLogsSession,
+  type HistoryBreakdown,
+  type HistoryRange,
+  type HistoryRouteFilter,
+} from '../lib/logsSession'
 import type {
   CustomAppGroup,
   DiagnosticEntry,
@@ -33,10 +41,6 @@ interface Props {
   onError: (error: unknown) => void
 }
 
-type Range = 'today' | '7d' | '30d'
-type Breakdown = 'app' | 'customGroup' | 'route'
-type RouteFilter = 'all' | 'proxy' | 'direct'
-
 function historySubjectValue(filter: HistorySubjectFilter | null): string {
   return filter ? JSON.stringify(filter) : 'all'
 }
@@ -57,7 +61,7 @@ function historySubjectFromValue(value: string): HistorySubjectFilter | null {
   return null
 }
 
-function historyPeriodLabel(bar: HistoryBar, range: Range): string {
+function historyPeriodLabel(bar: HistoryBar, range: HistoryRange): string {
   const date = new Date(bar.start * 1000)
   const options: Intl.DateTimeFormatOptions = range === 'today'
     ? { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }
@@ -67,15 +71,18 @@ function historyPeriodLabel(bar: HistoryBar, range: Range): string {
 
 export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
   const visible = useDocumentVisible()
-  const [tab, setTab] = useState<'history' | 'diagnostics'>('history')
-  const [range, setRange] = useState<Range>('7d')
-  const [breakdown, setBreakdown] = useState<Breakdown>('app')
-  const [routeFilter, setRouteFilter] = useState<RouteFilter>('all')
-  const [subjectFilter, setSubjectFilter] = useState<HistorySubjectFilter | null>(null)
+  const { tab, range, breakdown, routeFilter, subjectFilter } = useLogsSession()
+  const setTab = (next: 'history' | 'diagnostics') => updateLogsSession({ tab: next })
+  const setRange = (next: HistoryRange) => updateLogsSession({ range: next })
+  const setBreakdown = (next: HistoryBreakdown) => updateLogsSession({ breakdown: next })
+  const setRouteFilter = (next: HistoryRouteFilter) => updateLogsSession({ routeFilter: next })
+  const setSubjectFilter = (next: HistorySubjectFilter | null) => updateLogsSession({ subjectFilter: next })
   const [historyRevision, setHistoryRevision] = useState(0)
   const [report, setReport] = useState<HistoryReport | null>(null)
   const [availableApps, setAvailableApps] = useState<string[]>([])
   const [inspectedPeriod, setInspectedPeriod] = useState<HistoryBar | null>(null)
+  const [chartWidth, setChartWidth] = useState(0)
+  const chartRef = useRef<HTMLDivElement | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [clearOpen, setClearOpen] = useState(false)
   const [clearConfirmed, setClearConfirmed] = useState(false)
@@ -153,6 +160,17 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
     }
   }, [onError, tab, visible])
 
+  useLayoutEffect(() => {
+    const node = chartRef.current
+    if (!node) return
+    const observer = new ResizeObserver(([entry]) => {
+      setChartWidth(entry.contentRect.width)
+    })
+    observer.observe(node)
+    setChartWidth(node.getBoundingClientRect().width)
+    return () => observer.disconnect()
+  }, [report, tab])
+
   const max = useMemo(
     () => Math.max(1, ...(report?.bars.flatMap((bar) => [bar.proxyTotal, bar.directTotal]) ?? [1])),
     [report],
@@ -161,11 +179,22 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
     () => snapshot.state.customAppGroups.filter((group) => group.apps.length > 0),
     [snapshot.state.customAppGroups],
   )
+  const selectedAppOption = subjectFilter?.kind === 'app'
+    && !availableApps.some((app) => app.localeCompare(subjectFilter.name, undefined, { sensitivity: 'accent' }) === 0)
+    ? subjectFilter.name
+    : null
   const hasHistoryFilters = routeFilter !== 'all' || subjectFilter !== null
   const orderedDiagnostics = useMemo(
     () => sortDiagnosticsNewestFirst(diagnostics),
     [diagnostics],
   )
+  const tickEvery = useMemo(() => {
+    const barCount = report?.bars.length ?? 0
+    if (!barCount || chartWidth <= 0) return 1
+    // Keep roughly 44px between visible date ticks; every period keeps its
+    // full label in the inspector, title, and accessible name.
+    return Math.max(1, Math.ceil(44 / (chartWidth / barCount)))
+  }, [chartWidth, report?.bars.length])
 
   const closeClearDialog = () => {
     if (clearPendingRef.current) return
@@ -238,7 +267,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                 <select
                   aria-label="Route"
                   value={routeFilter}
-                  onChange={(event) => setRouteFilter(event.target.value as RouteFilter)}
+                  onChange={(event) => setRouteFilter(event.target.value as HistoryRouteFilter)}
                 >
                   <option value="all">All routes</option>
                   <option value="proxy">Proxy</option>
@@ -252,6 +281,9 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                   onChange={(event) => setSubjectFilter(historySubjectFromValue(event.target.value))}
                 >
                   <option value="all">All apps and groups</option>
+                  {selectedAppOption ? (
+                    <option value={historySubjectValue({ kind: 'app', name: selectedAppOption })}>{selectedAppOption}</option>
+                  ) : null}
                   {eligibleGroups.length > 0 ? (
                     <optgroup label="Custom app groups">
                       {eligibleGroups.map((group) => (
@@ -279,10 +311,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                   variant="secondary"
                   icon="refresh"
                   className="history-filter-reset"
-                  onClick={() => {
-                    setRouteFilter('all')
-                    setSubjectFilter(null)
-                  }}
+                  onClick={resetLogsFilters}
                 >
                   Reset filters
                 </Button>
@@ -349,11 +378,12 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                       <div className="bar-y-axis" aria-hidden="true">
                         {[1, 0.75, 0.5, 0.25, 0].map((fraction) => <span key={fraction}>{formatBytes(max * fraction)}</span>)}
                       </div>
-                      <div className="bar-chart-scroll" onMouseLeave={() => setInspectedPeriod(null)}>
-                        <div className="bar-chart" style={{ minWidth: `${Math.max(430, report.bars.length * (range === '30d' ? 34 : 52))}px` }}>
-                          {report.bars.map((bar) => {
+                      <div className="bar-chart-scroll" ref={chartRef} onMouseLeave={() => setInspectedPeriod(null)}>
+                        <div className={`bar-chart${tickEvery > 1 ? ' is-dense' : ''}`}>
+                          {report.bars.map((bar, index) => {
                             const periodLabel = historyPeriodLabel(bar, range)
                             const description = `${periodLabel}. Proxy ${formatBytes(bar.proxyTotal)}. Direct ${formatBytes(bar.directTotal)}. ${bar.gap ? 'Recording gap in this period.' : 'No recording gap recorded for this period.'}`
+                            const showTick = (report.bars.length - 1 - index) % tickEvery === 0
                             return (
                               <button
                                 type="button"
@@ -377,7 +407,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                                   <span className="bar-route-slot" data-history-route="proxy"><span className="bar bar-proxy" style={{ height: `${(bar.proxyTotal / max) * 100}%` }} /></span>
                                   <span className="bar-route-slot" data-history-route="direct"><span className="bar bar-direct" style={{ height: `${(bar.directTotal / max) * 100}%` }} /></span>
                                 </span>
-                                <span className={`bar-label ${bar.gap ? 'has-gap' : ''}`} aria-hidden="true">{bar.label}{bar.gap ? ' ·' : ''}</span>
+                                <span className={`bar-label ${bar.gap ? 'has-gap' : ''} ${showTick ? 'is-tick' : 'is-tick-hidden'}`} aria-hidden="true" data-history-tick={showTick ? 'true' : 'false'}>{bar.label}{bar.gap ? ' ·' : ''}</span>
                               </button>
                             )
                           })}
@@ -396,9 +426,10 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
           <Toolbar className="breakdown-row">
             <label>
               <span className="sr-only">Breakdown</span>
-              <select value={breakdown} onChange={(event) => setBreakdown(event.target.value as Breakdown)}>
+              <select value={breakdown} onChange={(event) => setBreakdown(event.target.value as HistoryBreakdown)}>
                 <option value="app">By app</option>
                 <option value="customGroup">By custom group</option>
+                <option value="rule">By ruleset rule</option>
                 <option value="route">By route</option>
               </select>
             </label>
@@ -415,7 +446,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                 <table className="history-table">
                   <thead>
                     <tr>
-                      <th scope="col">{breakdown === 'route' ? 'Route' : breakdown === 'customGroup' ? 'Group' : 'App'}</th>
+                      <th scope="col">{breakdown === 'route' ? 'Route' : breakdown === 'customGroup' ? 'Group' : breakdown === 'rule' ? 'Rule' : 'App'}</th>
                       <th scope="col" className="numeric">Download</th>
                       <th scope="col" className="numeric">Upload</th>
                       <th scope="col" className="numeric">Transferred</th>
@@ -448,13 +479,7 @@ export function LogsPage({ snapshot, onSnapshot, onError }: Props) {
                   ? 'Try another route, app, or custom group. You can reset both filters to see all recorded traffic.'
                   : 'Traffic history will appear here after attributed or total traffic is recorded.'}
                 action={hasHistoryFilters ? (
-                  <Button
-                    variant="secondary"
-                    onClick={() => {
-                      setRouteFilter('all')
-                      setSubjectFilter(null)
-                    }}
-                  >
+                  <Button variant="secondary" onClick={resetLogsFilters}>
                     Reset filters
                   </Button>
                 ) : undefined}

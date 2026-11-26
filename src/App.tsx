@@ -3,6 +3,7 @@ import { api, emptySnapshot, subscribeErrors, subscribeSnapshots } from './api'
 import { Sidebar, type Page } from './components/Sidebar'
 import { Titlebar } from './components/Titlebar'
 import { Banner } from './components/ui'
+import { useRateRecorder } from './lib/rateRecorder'
 import { ConnectionsPage } from './pages/ConnectionsPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { LogsPage } from './pages/LogsPage'
@@ -23,6 +24,7 @@ function App() {
   const [snapshot, setSnapshot] = useState<Snapshot>(() => emptySnapshot())
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  useRateRecorder(snapshot.runtime.vpnActive)
 
   const reload = useCallback(async () => {
     try {

@@ -26,6 +26,7 @@ export type IconName =
   | 'arrow-up'
   | 'arrow-down'
   | 'dots'
+  | 'grip'
 
 const paths: Record<IconName, ReactNode> = {
   dashboard: (
@@ -126,6 +127,16 @@ const paths: Record<IconName, ReactNode> = {
       <circle cx="5" cy="12" r="1" />
       <circle cx="12" cy="12" r="1" />
       <circle cx="19" cy="12" r="1" />
+    </>
+  ),
+  grip: (
+    <>
+      <circle cx="9" cy="6" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="6" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="9" cy="12" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="12" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="9" cy="18" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="18" r="1.2" fill="currentColor" stroke="none" />
     </>
   ),
 }

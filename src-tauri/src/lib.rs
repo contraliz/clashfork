@@ -1,6 +1,7 @@
 mod commands;
 mod controller;
 mod diagnostics;
+mod export;
 mod history;
 mod models;
 mod network;
@@ -47,6 +48,7 @@ pub fn run() {
             commands::save_match_group,
             commands::delete_match_group,
             commands::save_ruleset,
+            commands::save_routing_export,
             commands::delete_ruleset,
             commands::save_preset,
             commands::delete_preset,

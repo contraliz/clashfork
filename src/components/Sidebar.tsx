@@ -1,3 +1,4 @@
+import packageInfo from '../../package.json'
 import type { RuntimeView } from '../types'
 import { Icon, Logo, type IconName } from './Icon'
 
@@ -50,7 +51,7 @@ export function Sidebar({
         <span className="sidebar-foot-text">
           {runtime.serviceAvailable ? 'TUN service ready' : runtime.serviceMessage ? 'TUN service unavailable' : 'TUN service check'}
         </span>
-        <span className="version">1.0.11</span>
+        <span className="version">{packageInfo.version}</span>
       </div>
     </aside>
   )

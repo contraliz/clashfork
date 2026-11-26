@@ -1,7 +1,7 @@
 use crate::{
     controller::CoreController,
     diagnostics::Diagnostics,
-    history::HistoryStore,
+    history::{FlowRecord, HistoryStore},
     models::{
         AppState, CoreStatus, CustomAppGroup, HistoryInput, HistoryReport, ImportPreview,
         LiveRates, LiveRoute, LiveSnapshot, Mode, NodeTestProgress, NodeTestSummary, NodeView,
@@ -9,7 +9,7 @@ use crate::{
         StoredNodeLatency,
     },
     paths::AppPaths,
-    rules::{self, ControllerConfig},
+    rules::{self, ControllerConfig, RuleAttribution, RuleAttributionMap, rule_match_key},
     security, service_client, store,
 };
 use anyhow::{Context, Result, bail};
@@ -43,7 +43,7 @@ pub struct ActiveCore {
     mode: Mode,
     node_routes: BTreeMap<String, String>,
     node_fingerprints: BTreeMap<String, String>,
-    match_groups: BTreeMap<String, String>,
+    rule_attributions: RuleAttributionMap,
 }
 
 #[derive(Clone)]
@@ -731,7 +731,7 @@ impl AppRuntime {
                         mode: state.selection.mode,
                         node_routes: compiled.node_routes.clone(),
                         node_fingerprints: compiled.node_fingerprints.clone(),
-                        match_groups: match_groups_by_core(&state),
+                        rule_attributions: compiled.rule_attributions.clone(),
                     };
                     let reload_started = Instant::now();
                     let reload = standby.core.controller.reload(&config_path).await;
@@ -942,7 +942,7 @@ impl AppRuntime {
                     mode: state.selection.mode,
                     node_routes: compiled.node_routes.clone(),
                     node_fingerprints: compiled.node_fingerprints.clone(),
-                    match_groups: match_groups_by_core(&state),
+                    rule_attributions: compiled.rule_attributions.clone(),
                 });
             }
             self.fail_start(&error);
@@ -984,7 +984,7 @@ impl AppRuntime {
                     mode: state.selection.mode,
                     node_routes: compiled.node_routes,
                     node_fingerprints: compiled.node_fingerprints,
-                    match_groups: match_groups_by_core(&state),
+                    rule_attributions: compiled.rule_attributions.clone(),
                 };
                 if service_client::stop(&self.paths, &active_candidate.core.session)
                     .await
@@ -1001,7 +1001,6 @@ impl AppRuntime {
         }
         let summary =
             rules::active_summary(&state, &state.selection).unwrap_or_else(|_| "Connected".into());
-        let match_groups = match_groups_by_core(&state);
         let active = ActiveCore {
             core: core_session,
             yaml: compiled.yaml,
@@ -1009,7 +1008,7 @@ impl AppRuntime {
             mode: state.selection.mode,
             node_routes: compiled.node_routes,
             node_fingerprints: compiled.node_fingerprints,
-            match_groups,
+            rule_attributions: compiled.rule_attributions,
         };
         let _sample_guard = self.sample_gate.write().await;
         let mut engine = self.engine.lock();
@@ -1516,7 +1515,7 @@ impl AppRuntime {
             );
         }
         let summary = rules::active_summary(candidate, &candidate.selection)?;
-        let match_groups = match_groups_by_core(candidate);
+        let rule_attributions = compiled.rule_attributions.clone();
         let generation = {
             let mut engine = self.engine.lock();
             if let Some(active_state) = engine.active.as_mut() {
@@ -1525,7 +1524,7 @@ impl AppRuntime {
                 active_state.mode = candidate.selection.mode;
                 active_state.node_routes = compiled.node_routes;
                 active_state.node_fingerprints = compiled.node_fingerprints;
-                active_state.match_groups = match_groups;
+                active_state.rule_attributions = rule_attributions;
             }
             engine.generation = self.generation.fetch_add(1, Ordering::SeqCst);
             engine.pending_reconnect_services.clear();
@@ -3055,46 +3054,6 @@ mod tests {
     }
 }
 
-fn match_groups_by_core(state: &AppState) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    if state.selection.mode != Mode::Rule {
-        return map;
-    }
-    let Some(ruleset) = state
-        .selection
-        .ruleset_id
-        .as_ref()
-        .and_then(|id| state.rulesets.iter().find(|ruleset| &ruleset.id == id))
-    else {
-        return map;
-    };
-    for entry in &ruleset.entries {
-        if let crate::models::Destination::Node { node_id } = &entry.destination
-            && let Some(node) = state.nodes.iter().find(|node| &node.id == node_id)
-        {
-            let label = if entry.name.is_empty() {
-                state
-                    .match_groups
-                    .iter()
-                    .find(|group| group.id == entry.match_group_id)
-                    .map(|group| group.name.as_str())
-                    .unwrap_or("Rule")
-            } else {
-                entry.name.as_str()
-            };
-            map.entry(node.core_name.clone())
-                .or_insert(label.to_owned());
-        }
-    }
-    if let crate::models::Miscellaneous::Node { node_id } = &ruleset.miscellaneous
-        && let Some(node) = state.nodes.iter().find(|node| &node.id == node_id)
-    {
-        map.entry(node.core_name.clone())
-            .or_insert_with(|| "Everything else".to_owned());
-    }
-    map
-}
-
 fn sanitize_service_title(title: &str) -> Result<String> {
     let title = title.trim();
     if title.is_empty() {
@@ -3400,7 +3359,7 @@ async fn sampler_loop(runtime: Arc<AppRuntime>) {
                     .and_then(serde_json::Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                let mut flow_deltas: Vec<(String, String, RouteClass, u64, u64)> = Vec::new();
+                let mut flow_deltas: Vec<FlowRecord> = Vec::new();
                 let mut proxy_deltas: Vec<(RouteClass, u64, u64)> = Vec::new();
                 let mut live_routes = Vec::new();
                 let mut previous_flows: HashMap<String, (u64, u64)> = HashMap::new();
@@ -3427,19 +3386,25 @@ async fn sampler_loop(runtime: Arc<AppRuntime>) {
                         let flow_down = download.saturating_sub(previous_down);
                         let flow_up = upload.saturating_sub(previous_up);
                         let route = route_for(&active, connection);
+                        let attribution = rule_attribution_for(&active, connection);
+                        let matched_group = attribution.as_ref().map(|value| value.label.clone());
                         if route.class == RouteClass::Proxy {
                             proxy_deltas.push((route.class, flow_down, flow_up));
                         }
                         if flow_down > 0 || flow_up > 0 {
                             let app = app_for(connection);
                             if let Some(app) = &app {
-                                flow_deltas.push((
-                                    app.clone(),
-                                    route.label.clone(),
-                                    route.class,
-                                    flow_down,
-                                    flow_up,
-                                ));
+                                flow_deltas.push(FlowRecord {
+                                    app: app.clone(),
+                                    route: route.label.clone(),
+                                    route_class: route.class,
+                                    rule_id: attribution
+                                        .as_ref()
+                                        .map(|value| value.rule_id.clone()),
+                                    rule_label: matched_group.clone(),
+                                    download: flow_down,
+                                    upload: flow_up,
+                                });
                             }
                             live_routes.push(LiveRoute {
                                 app: app.unwrap_or_else(|| "Unattributed".to_owned()),
@@ -3451,7 +3416,7 @@ async fn sampler_loop(runtime: Arc<AppRuntime>) {
                                     .unwrap_or("tcp")
                                     .to_owned(),
                                 route: route.label,
-                                matched_group: matched_group_for(&active, connection),
+                                matched_group,
                                 download_rate: (flow_down as f64 / elapsed).round() as u64,
                                 upload_rate: (flow_up as f64 / elapsed).round() as u64,
                                 download_total: download,
@@ -3471,7 +3436,7 @@ async fn sampler_loop(runtime: Arc<AppRuntime>) {
                                     .unwrap_or("tcp")
                                     .to_owned(),
                                 route: route.label,
-                                matched_group: matched_group_for(&active, connection),
+                                matched_group,
                                 download_rate: 0,
                                 upload_rate: 0,
                                 download_total: download,
@@ -3499,7 +3464,7 @@ async fn sampler_loop(runtime: Arc<AppRuntime>) {
                             format!("Traffic total history write failed: {error}"),
                         );
                     }
-                    if let Err(error) = history.record_apps(now, &flow_deltas) {
+                    if let Err(error) = history.record_flows(now, &flow_deltas) {
                         runtime.diagnostics.push(
                             "app",
                             "warn",
@@ -3624,19 +3589,32 @@ fn route_from_chains(
     }
 }
 
-fn matched_group_for(active: &ActiveCore, connection: &serde_json::Value) -> Option<String> {
-    for chain in connection
-        .get("chains")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
+fn rule_attribution_for(
+    active: &ActiveCore,
+    connection: &serde_json::Value,
+) -> Option<RuleAttribution> {
+    let rule = connection
+        .get("rule")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            connection
+                .pointer("/metadata/rule")
+                .and_then(serde_json::Value::as_str)
+        })?;
+    let payload = connection
+        .get("rulePayload")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            connection
+                .pointer("/metadata/rulePayload")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("");
+    active
+        .rule_attributions
+        .get(&rule_match_key(rule, payload))
+        .cloned()
         .flatten()
-        .filter_map(serde_json::Value::as_str)
-    {
-        if let Some(group) = active.match_groups.get(chain) {
-            return Some(group.clone());
-        }
-    }
-    None
 }
 
 fn destination_for(connection: &serde_json::Value) -> String {

@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { api } from '../api'
+import { api, isTauri } from '../api'
 import { SelectedNodeLatency } from '../components/NodeLatency'
 import { useNowMs } from '../hooks'
+import { downloadJsonFile } from '../lib/download'
+import { safeExportFileName } from '../lib/exportName'
 import type { ConditionKind, Destination, MatchCondition, NodeView, Ruleset, RulesetEntry, Snapshot } from '../types'
-import { Button, EmptyState, Field, IconButton, Modal, PageHeader, Panel, Toolbar } from '../components/ui'
+import { Banner, Button, EmptyState, Field, IconButton, Modal, PageHeader, Panel, Toolbar } from '../components/ui'
 
 interface Props { snapshot: Snapshot; onSnapshot: (snapshot: Snapshot) => void; onError: (error: unknown) => void }
 type Draft = { id: string | null; name: string; entries: RulesetEntry[]; miscellaneous: Destination }
@@ -94,6 +96,7 @@ export function RulesetsPage({ snapshot, onSnapshot, onError }: Props) {
   const [importDoc, setImportDoc] = useState<PortableDoc | null>(null)
   const [proxyMap, setProxyMap] = useState<Record<string, string>>({})
   const [importName, setImportName] = useState('')
+  const [exportNotice, setExportNotice] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const draftCache = useRef<Record<string, Draft>>({})
 
@@ -120,9 +123,21 @@ export function RulesetsPage({ snapshot, onSnapshot, onError }: Props) {
       if (saved) { delete draftCache.current[draftKey ?? '__new__']; delete draftCache.current[saved.id]; setDraftKeys(keys => keys.filter(key => key !== draftKey)); setCreating(false); setSelectedId(saved.id); setDraftKey(null); setDraft(fromRuleset(saved)) }
     } catch (e) { onError(e) } finally { setBusy(false) }
   }
-  const exportDoc = (type: 'rule' | 'ruleset', entry?: RulesetEntry) => {
+  const exportDoc = async (type: 'rule' | 'ruleset', entry?: RulesetEntry) => {
     const entries = type === 'rule' && entry ? [entry] : draft.entries
-    if ((type === 'ruleset' && !draft.name.trim()) || entries.some(e => !e.name.trim() || e.conditions.length < 1 || e.conditions.some(c => !validPortableCondition(c.kind, c.value)))) {
+    const invalidRule = entries.some(e =>
+      !e.name.trim()
+      || e.name.length > 80
+      || e.conditions.length < 1
+      || e.conditions.length > 50
+      || new Set(e.conditions.map(c => `${c.kind}:${c.value.trim().toLowerCase()}`)).size !== e.conditions.length
+      || e.conditions.some(c => !validPortableCondition(c.kind, c.value))
+    )
+    if (
+      entries.length > 200
+      || invalidRule
+      || (type === 'ruleset' && (!draft.name.trim() || draft.name.length > 80))
+    ) {
       onError(new Error('Routing files can be exported only when rules and conditions are valid.'))
       return
     }
@@ -142,8 +157,21 @@ export function RulesetsPage({ snapshot, onSnapshot, onError }: Props) {
     if (draft.miscellaneous.kind === 'node') miscellaneous = portableDestination(draft.miscellaneous.nodeId, state.nodes, refs)
     else miscellaneous = draft.miscellaneous.kind
     const doc: PortableDoc = { format: 'clashfork-routing', version: 1, type, ...(type === 'ruleset' ? { name: draft.name, rules, miscellaneous } : { rule: rules[0] }) }
-    const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `clashfork-${type}.json`; a.click(); URL.revokeObjectURL(url)
+    const contents = JSON.stringify(doc, null, 2)
+    const baseName = type === 'ruleset' ? draft.name : entry?.name ?? 'rule'
+    const fileName = safeExportFileName(`${type === 'ruleset' ? 'clashfork-ruleset' : 'clashfork-rule'}-${baseName}`, `clashfork-${type}`)
+    try {
+      if (isTauri) {
+        const result = await api.saveRoutingExport(fileName, contents)
+        if (result.canceled) return
+        setExportNotice(`Saved ${result.fileName ?? fileName}.`)
+      } else {
+        downloadJsonFile(contents, fileName)
+        setExportNotice(`Downloaded ${fileName}.`)
+      }
+    } catch (error) {
+      onError(error)
+    }
   }
   const readFile = async (file?: File) => {
     if (!file) return
@@ -228,6 +256,7 @@ export function RulesetsPage({ snapshot, onSnapshot, onError }: Props) {
 
   return <div className="rulesets-page">
     <PageHeader title="Rulesets" actions={<Button variant="primary" onClick={newRuleset}>New ruleset</Button>} />
+    {exportNotice ? <Banner tone="info" onDismiss={() => setExportNotice(null)}>{exportNotice}</Banner> : null}
     <Panel className="unified-rules-panel">
       <Toolbar className="unified-rules-toolbar">
         <Field label="Ruleset" className="unified-rules-select"><select aria-label="Ruleset" value={creating ? draftKey ?? '' : selectedId ?? ''} onChange={e => e.target.value && selectRuleset(e.target.value)}>
