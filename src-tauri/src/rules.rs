@@ -1370,8 +1370,9 @@ mod tests {
         let config = format!(
             "mixed-port: {mixed_port}\nallow-lan: false\nmode: rule\nlog-level: warning\nipv6: false\nexternal-controller: 127.0.0.1:{controller_port}\nsecret: fixture-secret\nhosts:\n  rule-fixture.test: 127.0.0.1\nrules:\n  - DOMAIN-SUFFIX,rule-fixture.test,DIRECT\n  - DOMAIN-SUFFIX,other-fixture.test,DIRECT\n  - MATCH,REJECT\n"
         );
-        let core =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/clashfork-core.exe");
+        let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(CORE_FILE_NAME);
         let scratch = tempfile::tempdir().unwrap();
         let config_path = scratch.path().join("metadata-fixture.yaml");
         std::fs::write(&config_path, config).unwrap();
