@@ -109,6 +109,10 @@ fn main() -> Result<(), Error> {
     use std::env;
     use std::path::Path;
 
+    #[cfg(feature = "client")]
+    if clashfork_service_ipc::management::prepare_uninstall_if_requested()? {
+        return Ok(());
+    }
     if run_maintenance_if_requested()? {
         return Ok(());
     }

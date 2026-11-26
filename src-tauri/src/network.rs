@@ -121,7 +121,72 @@ pub fn probe_tun_routes() -> TunRouteProbe {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn macos_interface_for(address: &str) -> Option<String> {
+    let output = std::process::Command::new("/sbin/route")
+        .args(["-n", "get", address])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.trim().split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("interface")
+                .then(|| value.trim().to_owned())
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn classify_macos_routes(routes: [Option<String>; 2]) -> TunRouteProbe {
+    let device = crate::rules::TUN_DEVICE;
+    let owned = routes
+        .iter()
+        .flatten()
+        .any(|name| name.eq_ignore_ascii_case(device));
+    let all_known = routes.iter().all(Option::is_some);
+    let both_owned = routes.iter().all(|name| {
+        name.as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(device))
+    });
+    let competing_utun = routes
+        .iter()
+        .flatten()
+        .any(|name| name.starts_with("utun") && !name.eq_ignore_ascii_case(device));
+    let readiness = if !all_known {
+        TunRouteReadiness::Indeterminate
+    } else if both_owned {
+        TunRouteReadiness::Ready
+    } else if competing_utun {
+        TunRouteReadiness::CompetingTunnel
+    } else {
+        TunRouteReadiness::Pending
+    };
+    TunRouteProbe {
+        readiness,
+        has_owned_route: if owned {
+            Some(true)
+        } else if all_known {
+            Some(false)
+        } else {
+            None
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn probe_tun_routes() -> TunRouteProbe {
+    classify_macos_routes([
+        macos_interface_for("1.1.1.1"),
+        macos_interface_for("8.8.8.8"),
+    ])
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn probe_tun_routes() -> TunRouteProbe {
     TunRouteProbe {
         readiness: TunRouteReadiness::Unsupported,
@@ -244,5 +309,31 @@ mod tests {
             super::owned_route_present([Route::OtherTunnel, Route::OtherInterface]),
             Some(false)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_route_readiness_matches_the_configured_utun_device() {
+        let device = crate::rules::TUN_DEVICE.to_owned();
+        let other_utun = if device == "utun0" { "utun1" } else { "utun0" }.to_owned();
+        let direct = "en0".to_owned();
+        let owned = super::classify_macos_routes([Some(device.clone()), Some(device.clone())]);
+        assert_eq!(owned.readiness, super::TunRouteReadiness::Ready);
+        assert_eq!(owned.has_owned_route, Some(true));
+
+        let handoff = super::classify_macos_routes([Some(device), Some(direct.clone())]);
+        assert_eq!(handoff.readiness, super::TunRouteReadiness::Pending);
+        assert_eq!(handoff.has_owned_route, Some(true));
+
+        let competing = super::classify_macos_routes([Some(other_utun), Some(direct.clone())]);
+        assert_eq!(
+            competing.readiness,
+            super::TunRouteReadiness::CompetingTunnel
+        );
+        assert_eq!(competing.has_owned_route, Some(false));
+
+        let direct = super::classify_macos_routes([Some(direct), None]);
+        assert_eq!(direct.readiness, super::TunRouteReadiness::Indeterminate);
+        assert_eq!(direct.has_owned_route, None);
     }
 }

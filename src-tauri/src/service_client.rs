@@ -266,7 +266,7 @@ pub fn stored_session(token: &str, generation: u64) -> StoredSession {
 pub fn safe_service_message(code: u16, message: &str) -> String {
     let category = match code {
         x if x == ServiceErrorCode::UnauthorizedOwner as u16 => {
-            "The current Windows user is not authorized"
+            "The current system user is not authorized"
         }
         x if x == ServiceErrorCode::NotActive as u16 => "The VPN session is no longer active",
         x if x == ServiceErrorCode::InvalidInstallLocation as u16 => {
@@ -276,7 +276,7 @@ pub fn safe_service_message(code: u16, message: &str) -> String {
             "The generated runtime was rejected"
         }
         x if x == ServiceErrorCode::OwnerSwitchFailed as u16 => {
-            "Another Windows user owns the VPN service"
+            "Another system user owns the VPN service"
         }
         x if x == ServiceErrorCode::ProtocolMismatch as u16 => "The service protocol is mismatched",
         x if x == ServiceErrorCode::StaleOwnerSession as u16 => {
@@ -452,5 +452,183 @@ mod tests {
         .await;
         assert!(result.is_err());
         server.abort();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_service_tun_smoke {
+    use super::*;
+    use crate::controller::CoreController;
+    use reqwest::Client;
+    use std::{net::TcpListener, process::Command, time::Duration};
+
+    fn free_port() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn fixture_yaml(mode: &str, controller_port: u16, dns_port: u16, secret: &str) -> String {
+        let (groups, route) = if mode == "global" {
+            (
+                "proxy-groups:\n  - name: GLOBAL\n    type: select\n    proxies:\n      - DIRECT\n",
+                "MATCH,GLOBAL",
+            )
+        } else {
+            ("", "MATCH,DIRECT")
+        };
+        format!(
+            "mixed-port: 0\nallow-lan: false\nmode: {mode}\nlog-level: warning\nipv6: false\nfind-process-mode: always\nunified-delay: true\nexternal-controller: 127.0.0.1:{controller_port}\nsecret: {secret}\nprofile:\n  store-selected: false\n  store-fake-ip: false\ntun:\n  enable: true\n  stack: mixed\n  device: {}\n  auto-route: true\n  auto-detect-interface: true\n  strict-route: true\n  dns-hijack:\n    - any:53\n    - tcp://any:53\ndns:\n  enable: true\n  listen: 127.0.0.1:{dns_port}\n  ipv6: false\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n  nameserver:\n    - https://1.1.1.1/dns-query\n    - https://223.5.5.5/dns-query\n{groups}rules:\n  - {route}\n",
+            crate::rules::TUN_DEVICE
+        )
+    }
+
+    fn route_interface(address: &str) -> Option<String> {
+        let output = Command::new("/sbin/route")
+            .args(["-n", "get", address])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout)
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.trim().split_once(':')?;
+                key.trim()
+                    .eq_ignore_ascii_case("interface")
+                    .then(|| value.trim().to_owned())
+            })
+    }
+
+    async fn fixed_https_probe() -> Result<()> {
+        let response = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(15))
+            .build()?
+            .get("https://www.gstatic.com/generate_204")
+            .send()
+            .await?;
+        anyhow::ensure!(response.status() == reqwest::StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable macOS runner with the Clashfork launchd service installed"]
+    async fn stock_mihomo_authenticated_service_runs_tun_in_rule_and_global_then_stops()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let paths = AppPaths::at(temporary.path().join("Clashfork"))?;
+        let credentials = security::current_owner_credentials(&paths.data_root)?;
+        let controller_config = ControllerConfig {
+            port: free_port(),
+            secret: new_session_token(),
+            dns_port: free_port(),
+        };
+        let token = new_session_token();
+        security::write_private_file(
+            &paths.secrets_file,
+            &serde_json::to_vec(&stored_session(&token, 0))?,
+        )?;
+        let protocol = probe()
+            .await
+            .protocol_info
+            .context("installed service did not answer its protocol probe")?;
+        let controller = CoreController::new(
+            controller_config.port,
+            controller_config.secret.clone(),
+            Client::new(),
+        );
+        let mut proof = None;
+
+        let exercise = async {
+            let (started, session, _) = start(
+                &paths,
+                fixture_yaml(
+                    "rule",
+                    controller_config.port,
+                    controller_config.dns_port,
+                    &controller_config.secret,
+                ),
+                &controller_config,
+                token.clone(),
+                protocol,
+            )
+            .await?;
+            proof = Some(session.clone());
+            security::write_private_file(
+                &paths.secrets_file,
+                &serde_json::to_vec(&stored_session(&session.token, session.generation))?,
+            )?;
+            anyhow::ensure!(started.session.generation == session.generation);
+            wait_ready_config(&controller, "rule", true).await?;
+            for address in ["1.1.1.1", "8.8.8.8"] {
+                anyhow::ensure!(
+                    route_interface(address).as_deref() == Some(crate::rules::TUN_DEVICE),
+                    "the public best route for {address} did not select the requested utun device"
+                );
+            }
+            fixed_https_probe().await?;
+
+            let staged = stage(
+                &paths,
+                fixture_yaml(
+                    "global",
+                    controller_config.port,
+                    controller_config.dns_port,
+                    &controller_config.secret,
+                ),
+                &session,
+            )
+            .await?;
+            let Staged::Ready(config_path) = staged else {
+                anyhow::bail!("the service requested an untested core restart during a mode change")
+            };
+            controller.reload(&config_path).await?;
+            wait_ready_config(&controller, "global", true).await?;
+            fixed_https_probe().await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if proof.is_none()
+            && let Ok(response) = clashfork_service_ipc::get_status(&credentials).await
+            && let Some(status) = response.data
+            && status.is_active
+            && let Some(generation) = status.active_generation
+        {
+            proof = Some(OwnerSessionProof {
+                generation,
+                token: token.clone(),
+            });
+        }
+
+        let cleanup = match proof.as_ref() {
+            Some(session) => stop(&paths, session).await,
+            None => Ok(()),
+        };
+        if cleanup.is_err() {
+            let retained = temporary.keep();
+            anyhow::bail!(
+                "TUN smoke cleanup failed; private session proof was retained at {:?}",
+                retained
+            );
+        }
+        let status = clashfork_service_ipc::get_status(&credentials).await?;
+        anyhow::ensure!(
+            status.code == 0 && status.data.is_some_and(|snapshot| !snapshot.is_active),
+            "the service did not confirm that its TUN session stopped"
+        );
+        for address in ["1.1.1.1", "8.8.8.8"] {
+            let interface = route_interface(address).with_context(|| {
+                format!("the route API could not confirm cleanup for {address}")
+            })?;
+            anyhow::ensure!(
+                interface != crate::rules::TUN_DEVICE,
+                "the public route for {address} remained on the Clashfork utun after stop"
+            );
+        }
+        exercise?;
+        Ok(())
     }
 }

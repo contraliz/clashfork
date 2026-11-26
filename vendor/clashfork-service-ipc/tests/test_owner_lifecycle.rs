@@ -119,7 +119,7 @@ async fn installation_query_reports_global_occupancy_and_guards_handoff() -> Res
     use clashfork_service_ipc::execution::reserve_sidecar;
     use clashfork_service_ipc::{CoreAvailability, CoreRequirement, inspect_installation};
     let server = start_server().await?;
-    let name = format!("clashfork-core-alpha{}", std::env::consts::EXE_SUFFIX);
+    let name = format!("clashfork-core{}", std::env::consts::EXE_SUFFIX);
     let directory = clashfork_service_ipc::service_paths()?.core_dir();
     std::fs::create_dir_all(&directory)?;
     let core = directory.join(&name);

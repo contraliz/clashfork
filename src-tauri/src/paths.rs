@@ -6,7 +6,10 @@ use std::{
 
 pub const DATA_DIR_NAME: &str = "Clashfork";
 pub const SERVICE_SLUG: &str = "clashfork-service";
+#[cfg(windows)]
 pub const CORE_FILE_NAME: &str = "clashfork-core.exe";
+#[cfg(target_os = "macos")]
+pub const CORE_FILE_NAME: &str = "clashfork-core";
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -23,10 +26,17 @@ impl AppPaths {
         let root = if let Some(root) = env::var_os("CLASHFORK_DATA_DIR") {
             PathBuf::from(root)
         } else {
-            env::var_os("LOCALAPPDATA")
+            #[cfg(windows)]
+            let base = env::var_os("LOCALAPPDATA")
                 .map(PathBuf::from)
-                .context("LOCALAPPDATA is unavailable")?
-                .join(DATA_DIR_NAME)
+                .context("LOCALAPPDATA is unavailable")?;
+            #[cfg(target_os = "macos")]
+            let base = env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is unavailable")?
+                .join("Library")
+                .join("Application Support");
+            base.join(DATA_DIR_NAME)
         };
         Self::at(root)
     }
@@ -40,21 +50,37 @@ impl AppPaths {
             history_file: root.join("history.sqlite3"),
             data_root: root,
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for path in [&paths.data_root, &paths.runtime_dir, &paths.logs_dir] {
+                std::fs::create_dir_all(path)?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        #[cfg(windows)]
         std::fs::create_dir_all(&paths.data_root)
             .with_context(|| format!("failed to create {:?}", paths.data_root))?;
+        #[cfg(windows)]
         std::fs::create_dir_all(&paths.runtime_dir)
             .with_context(|| format!("failed to create {:?}", paths.runtime_dir))?;
+        #[cfg(windows)]
         std::fs::create_dir_all(&paths.logs_dir)
             .with_context(|| format!("failed to create {:?}", paths.logs_dir))?;
         Ok(paths)
     }
 
     pub fn installed_core(&self) -> Result<PathBuf> {
-        let program_data = env::var_os("ProgramData").context("ProgramData is unavailable")?;
-        Ok(PathBuf::from(program_data)
-            .join(SERVICE_SLUG)
-            .join("cores")
-            .join(CORE_FILE_NAME))
+        #[cfg(windows)]
+        {
+            let program_data = env::var_os("ProgramData").context("ProgramData is unavailable")?;
+            Ok(PathBuf::from(program_data)
+                .join(SERVICE_SLUG)
+                .join("cores")
+                .join(CORE_FILE_NAME))
+        }
+        #[cfg(target_os = "macos")]
+        bail!("the service owns its protected core installation directory")
     }
 
     pub fn bundled_core(&self) -> Result<PathBuf> {
@@ -72,6 +98,11 @@ impl AppPaths {
             exe_dir.join("resources").join(CORE_FILE_NAME),
             exe_dir.join(CORE_FILE_NAME),
             exe_dir.join("..").join("resources").join(CORE_FILE_NAME),
+            exe_dir
+                .join("..")
+                .join("Resources")
+                .join("resources")
+                .join(CORE_FILE_NAME),
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("resources")
                 .join(CORE_FILE_NAME),
@@ -85,14 +116,52 @@ impl AppPaths {
     }
 
     pub fn service_install_helper(&self) -> Result<PathBuf> {
-        self.resource_exe("clashfork-service-install.exe")
+        #[cfg(windows)]
+        {
+            self.resource("clashfork-service-install.exe")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.resource("clashfork-service-install")
+        }
     }
 
     pub fn service_uninstall_helper(&self) -> Result<PathBuf> {
-        self.resource_exe("clashfork-service-uninstall.exe")
+        #[cfg(windows)]
+        {
+            self.resource("clashfork-service-uninstall.exe")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.resource("clashfork-service-uninstall")
+        }
     }
 
-    fn resource_exe(&self, name: &str) -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    pub fn install_or_repair_macos_service(&self) -> Result<()> {
+        let helper = self.service_install_helper()?;
+        let core = self.bundled_core()?;
+        let output = std::process::Command::new(helper)
+            .args(["--prepare-install", "--core", "clashfork-core"])
+            .arg(core)
+            .args([
+                "--ensure",
+                "--prompt",
+                "Install or repair Clashfork's protected VPN service",
+            ])
+            .output()
+            .context("could not start the macOS service installer")?;
+        if !output.status.success() {
+            let details = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "Clashfork service installation did not complete: {}",
+                details.trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn resource(&self, name: &str) -> Result<PathBuf> {
         let exe = env::current_exe().context("failed to locate the Clashfork executable")?;
         let exe_dir = exe
             .parent()
@@ -103,6 +172,12 @@ impl AppPaths {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("resources")
                 .join(name),
+            exe_dir
+                .join("..")
+                .join("Resources")
+                .join("resources")
+                .join(name),
+            exe_dir.join("..").join("Resources").join(name),
         ];
         candidates
             .into_iter()
@@ -133,10 +208,15 @@ impl AppPaths {
 }
 
 pub fn program_data_service_root() -> Result<PathBuf> {
-    env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .map(|path| path.join(SERVICE_SLUG))
-        .context("ProgramData is unavailable")
+    #[cfg(windows)]
+    {
+        env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .map(|path| path.join(SERVICE_SLUG))
+            .context("ProgramData is unavailable")
+    }
+    #[cfg(target_os = "macos")]
+    bail!("the service owns its protected installation directory")
 }
 
 pub fn private_temp_file(directory: &Path, label: &str, bytes: &[u8]) -> Result<PathBuf> {

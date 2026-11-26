@@ -10,7 +10,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 pub const APP_GLOBAL_GROUP: &str = "GLOBAL";
+#[cfg(windows)]
 pub const TUN_DEVICE: &str = "ClashforkTUN";
+#[cfg(target_os = "macos")]
+pub const TUN_DEVICE: &str = "utun1000";
 pub const CORE_CONTROLLER_PORT: u16 = 19197;
 pub const DNS_PORT: u16 = 19198;
 
@@ -804,6 +807,7 @@ pub fn validate_with_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::CORE_FILE_NAME;
 
     #[test]
     fn standby_config_is_inert_and_only_exposes_the_loopback_controller() {
@@ -1273,8 +1277,9 @@ mod tests {
         let config = format!(
             "mixed-port: 0\nmode: direct\nipv6: false\ndns:\n  enable: true\n  listen: 127.0.0.1:{dns_port}\n  ipv6: false\n  enhanced-mode: normal\n  nameserver:\n    - 127.0.0.1:{dead_port}\n    - 127.0.0.1:{fixture_port}\nrules:\n  - MATCH,DIRECT\n"
         );
-        let core =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/clashfork-core.exe");
+        let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(CORE_FILE_NAME);
         let scratch = tempfile::tempdir().unwrap();
         let config_path = scratch.path().join("dns-fixture.yaml");
         std::fs::write(&config_path, config).unwrap();
@@ -1456,8 +1461,9 @@ mod tests {
             secret: "fixture-secret".into(),
             dns_port: 19198,
         };
-        let core =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/clashfork-core.exe");
+        let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(CORE_FILE_NAME);
         let scratch = tempfile::tempdir().unwrap();
         for selection in [rule, global] {
             let config =
@@ -1506,7 +1512,9 @@ mod tests {
         std::fs::write(&standby_file, standby).unwrap();
         std::fs::write(&app_file, app_config).unwrap();
 
-        let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/clashfork-core.exe");
+        let core = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(CORE_FILE_NAME);
         let child = Command::new(core)
             .arg("-d")
             .arg(scratch.path())
@@ -1584,7 +1592,9 @@ mod tests {
         };
         let after = build_runtime_yaml(&state, &secrets, &next, &config, false).unwrap();
 
-        let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/clashfork-core.exe");
+        let core = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(CORE_FILE_NAME);
         let scratch = tempfile::tempdir().unwrap();
         let initial_file = scratch.path().join("initial.yaml");
         let next_file = scratch.path().join("changed.yaml");

@@ -650,6 +650,26 @@ impl AppRuntime {
         }
         let startup_started = Instant::now();
         self.refresh_tunnel_advisory();
+        #[cfg(target_os = "macos")]
+        {
+            let install_paths = self.paths.clone();
+            let install_started = Instant::now();
+            let installed = tokio::task::spawn_blocking(move || {
+                install_paths.install_or_repair_macos_service()
+            })
+            .await
+            .context("the macOS service setup task did not complete")?;
+            self.record_startup_stage(
+                "macOS service setup",
+                install_started.elapsed(),
+                installed.is_ok(),
+            );
+            if let Err(error) = installed {
+                self.fail_start(&error);
+                self.record_startup_total(startup_started.elapsed(), false);
+                return Err(error);
+            }
+        }
         let preflight_started = Instant::now();
         let probe = service_client::probe().await;
         let preflight_elapsed = preflight_started.elapsed();
@@ -964,7 +984,7 @@ impl AppRuntime {
         )
         .await;
         self.record_startup_stage(
-            "Windows TUN route handoff",
+            "TUN route handoff",
             route_started.elapsed(),
             route_ready.is_ok(),
         );
@@ -972,7 +992,7 @@ impl AppRuntime {
             Ok(false) => self.diagnostics.push(
                 "app",
                 "warn",
-                "Mihomo reports TUN enabled, but Windows route ownership could not be queried; connection readiness is controller-verified only.",
+                "Mihomo reports TUN enabled, but route ownership could not be tied to the owned device; connection readiness is controller-verified only.",
             ),
             Ok(true) => {}
             Err(error) => {
@@ -3136,7 +3156,7 @@ async fn wait_for_tun_routes_ready(
                 controller_failures += 1;
                 if controller_failures >= 3 {
                     bail!(
-                        "Mihomo stopped confirming the active mode and TUN state during Windows route handoff."
+                        "Mihomo stopped confirming the active mode and TUN state during route handoff."
                     );
                 }
                 false
@@ -3204,7 +3224,7 @@ async fn wait_for_tun_routes_ready(
         | crate::network::TunRouteReadiness::Unsupported => Ok(false),
         crate::network::TunRouteReadiness::Pending | crate::network::TunRouteReadiness::Ready => {
             bail!(
-                "Windows did not confirm that public routes had settled on ClashforkTUN. The VPN session was stopped."
+                "The TUN device did not take ownership of the public routes. The VPN session was stopped."
             )
         }
     }
