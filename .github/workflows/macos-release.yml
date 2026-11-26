@@ -2,7 +2,8 @@ name: macOS release builds
 
 on:
   push:
-    branches: [codex/macos-release]
+    branches: [main, codex/macos-release]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
